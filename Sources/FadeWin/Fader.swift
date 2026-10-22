@@ -92,12 +92,19 @@ final class Fader {
     private var animTimer: Timer?
     private var lastAnim = Date()
 
+    /// 窗口在动（拖动、显示桌面时一起滑开）时雾层先藏起来，停稳了再淡回来；vis 就是这个“显现度”
+    private var lastMoved: [CGWindowID: Date] = [:]
+    private var vis: [CGWindowID: CGFloat] = [:]
+    private var settled: [CGWindowID: Bool] = [:]
+    private var captureBounds: [CGWindowID: CGRect] = [:]
+    static let settleDelay: TimeInterval = 0.35
+
     /// 透视时窗口最多透明到这里，保留一点影子，免得彻底看不见
     static let maxSeeThrough: CGFloat = 0.72
 
     func start() {
-        // 窗口列表 10 次/秒；动画 60 帧/秒，只改透明度，开销很小
-        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.poll() }
+        // 窗口列表 30 次/秒，好尽早发现窗口在动；动画 60 帧/秒，只改透明度，开销很小
+        let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
@@ -176,6 +183,8 @@ final class Fader {
         }
         targets = targets.filter { alive.contains($0.key) }
         shown = shown.filter { alive.contains($0.key) }
+        lastMoved = lastMoved.filter { alive.contains($0.key) }
+        vis = vis.filter { alive.contains($0.key) }
 
         let current = effectiveStyle
         if overlayStyle != current {
@@ -185,6 +194,8 @@ final class Fader {
 
         let (grace, full) = speed.span
         let screenH = NSScreen.screens.first?.frame.height ?? 0
+        // 各屏幕在 CG 坐标（左上角原点）里的范围，透视时只处理窗口在屏幕内的部分
+        let screensCG = NSScreen.screens.map { CGRect(x: $0.frame.minX, y: screenH - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height) }
         var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool)] = [:]
         let focusedID = wins.first(where: { $0.pid == frontPid })?.id
 
@@ -196,7 +207,15 @@ final class Fader {
             // 目标归零后雾层还要留着，等动画把它淡出去再收
             guard target > 0.002 || (shown[w.id] ?? 0) > 0.002 else { continue }
 
-            let frame = NSRect(x: w.bounds.minX, y: screenH - w.bounds.maxY, width: w.bounds.width, height: w.bounds.height)
+            var b = w.bounds
+            if current == .seeThrough {
+                let c = CGPoint(x: b.midX, y: b.midY)
+                if let scr = screensCG.first(where: { $0.contains(c) }) ?? screensCG.first(where: { $0.intersects(b) }) {
+                    b = b.intersection(scr)
+                }
+                guard !b.isNull, b.width >= 40, b.height >= 40 else { continue }
+            }
+            let frame = NSRect(x: b.minX, y: screenH - b.maxY, width: b.width, height: b.height)
             let win: NSWindow
             if let o = overlays[w.id] {
                 win = o
@@ -204,9 +223,21 @@ final class Fader {
                 win = makeOverlay()
                 overlays[w.id] = win
                 shown[w.id] = 0
+                vis[w.id] = 1
                 win.alphaValue = 0
             }
-            if win.frame != frame { win.setFrame(frame, display: false) }
+            if win.frame != frame {
+                if win.frame.width > 0 {
+                    // 窗口动了：雾层立刻藏起来，别追着窗口跑
+                    lastMoved[w.id] = now
+                    vis[w.id] = 0
+                    win.alphaValue = 0
+                }
+                win.setFrame(frame, display: false)
+            }
+            let moving = now.timeIntervalSince(lastMoved[w.id] ?? .distantPast) < Self.settleDelay
+            settled[w.id] = !moving
+            captureBounds[w.id] = b
             if w.id == focusedID, target <= 0.002 {
                 raise(win)
             } else {
@@ -216,7 +247,8 @@ final class Fader {
                 if oi == nil || wi == nil || oi! + 1 != wi! { win.order(.above, relativeTo: Int(w.id)) }
             }
             if current == .seeThrough, let v = win.contentView as? SeeView {
-                seeTargets[w.id] = (w, v, CGWindowID(win.windowNumber), target <= 0.002)
+                let clipped = WinInfo(id: w.id, pid: w.pid, owner: w.owner, title: w.title, bounds: b)
+                seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving)
             }
         }
 
@@ -252,7 +284,21 @@ final class Fader {
                 shown[id] = 0
                 continue
             }
-            apply(amount: s, id: id, style: current, veil: veil, to: win)
+
+            // 停稳之后再淡回来；透视还要等抓取画面对上新位置，不然会先闪一下旧画面
+            var ready = settled[id] ?? true
+            if ready, current == .seeThrough, let b = captureBounds[id] {
+                ready = MainActor.assumeIsolated { seeThrough.isReady(id, bounds: b) }
+            }
+            var v = vis[id] ?? 1
+            if ready {
+                v += (1 - v) * CGFloat(1 - exp(-9 * dt))
+                if v > 0.995 { v = 1 }
+            } else {
+                v = 0
+            }
+            vis[id] = v
+            apply(amount: s * v, id: id, style: current, veil: veil, to: win)
         }
     }
 

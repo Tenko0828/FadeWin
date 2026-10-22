@@ -55,6 +55,9 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// 改完抓取范围后，等新范围的第一帧到了才重新算“有画面”
+    func awaitFreshFrame() { live = false }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         DispatchQueue.main.async { [weak self] in
             self?.live = false
@@ -76,6 +79,12 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     nonisolated static var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
 
     func isLive(_ id: CGWindowID) -> Bool { replicas[id]?.live ?? false }
+
+    /// 抓取范围已经对上这个位置、并且有画面了。还没抓起来的（比如超过同时抓取上限）也算好了，交给薄雾顶着
+    func isReady(_ id: CGWindowID, bounds: CGRect) -> Bool {
+        guard let r = replicas[id] else { return !starting.contains(id) }
+        return r.live && r.bounds == bounds
+    }
 
     func stopAll() {
         for (_, r) in replicas { Task { try? await r.stream.stopCapture() } }
@@ -185,10 +194,13 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         let flt = filter(display: disp, excluding: excluded, content: content)
         Task { @MainActor in
             defer { r.updating = false }
-            try? await r.stream.updateConfiguration(cfg)
+            let moved = r.bounds != bounds
+            if moved { try? await r.stream.updateConfiguration(cfg) }
             try? await r.stream.updateContentFilter(flt)
             r.bounds = bounds
             r.excluded = excluded
+            // 只有位置/尺寸变了才要等新画面；只是层级变了（点了别的窗口）就接着用，免得闪
+            if moved { r.awaitFreshFrame() }
         }
     }
 }
