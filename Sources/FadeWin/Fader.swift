@@ -31,6 +31,23 @@ enum FadeSpeed: String, CaseIterable {
     }
 }
 
+enum FadeStyle: String, CaseIterable {
+    case glass, veil
+
+    var title: String {
+        switch self {
+        case .glass: "液态玻璃（越久越磨砂，内容逐渐虚化）"
+        case .veil: "纯色薄雾"
+        }
+    }
+
+    /// 液态玻璃需要 macOS 26
+    static var glassAvailable: Bool {
+        if #available(macOS 26, *) { return true }
+        return false
+    }
+}
+
 /// 给每个“很久没碰”的窗口盖一层随时间加深的薄雾；鼠标事件会穿透雾，点一下窗口就恢复
 final class Fader {
     static let maxAlpha: CGFloat = 0.74
@@ -48,6 +65,14 @@ final class Fader {
     var speed: FadeSpeed {
         get { FadeSpeed(rawValue: UserDefaults.standard.string(forKey: "speed") ?? "") ?? .normal }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "speed") }
+    }
+
+    var style: FadeStyle {
+        get {
+            let saved = FadeStyle(rawValue: UserDefaults.standard.string(forKey: "style") ?? "") ?? .glass
+            return saved == .glass && !FadeStyle.glassAvailable ? .veil : saved
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "style"); clearOverlays() }
     }
 
     func start() {
@@ -117,8 +142,19 @@ final class Fader {
             let win = overlays[w.id] ?? makeOverlay()
             overlays[w.id] = win
             win.setFrame(frame, display: false)
-            win.contentView?.layer?.backgroundColor = veil.withAlphaComponent(alpha).cgColor
+            apply(amount: alpha / Self.maxAlpha, veil: veil, to: win)
             win.order(.above, relativeTo: Int(w.id))
+        }
+    }
+
+    /// amount: 0...1，0 是刚开始褪，1 是褪到最浅
+    private func apply(amount: CGFloat, veil: NSColor, to win: NSWindow) {
+        if #available(macOS 26, *), let glass = win.contentView as? NSGlassEffectView {
+            // 玻璃本身随时间变厚；染色让它在浅色/深色下都不发灰
+            glass.alphaValue = min(1, amount * 1.4)
+            glass.tintColor = veil.withAlphaComponent(0.34 * amount)
+        } else {
+            win.contentView?.layer?.backgroundColor = veil.withAlphaComponent(Self.maxAlpha * amount).cgColor
         }
     }
 
@@ -130,10 +166,17 @@ final class Fader {
         win.ignoresMouseEvents = true
         win.isReleasedWhenClosed = false
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
-        let v = NSView()
-        v.wantsLayer = true
-        v.layer?.cornerRadius = 10
-        win.contentView = v
+        if #available(macOS 26, *), style == .glass {
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = 20
+            win.contentView = glass
+        } else {
+            let v = NSView()
+            v.wantsLayer = true
+            v.layer?.cornerRadius = 10
+            win.contentView = v
+        }
         return win
     }
 

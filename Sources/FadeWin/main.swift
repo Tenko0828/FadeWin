@@ -30,6 +30,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speedItem.submenu = sub
         menu.addItem(speedItem)
 
+        if FadeStyle.glassAvailable {
+            let styleItem = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
+            let sm = NSMenu()
+            for st in FadeStyle.allCases {
+                let mi = item(st.title, #selector(pickStyle(_:)), on: fader.style == st)
+                mi.representedObject = st.rawValue
+                sm.addItem(mi)
+            }
+            styleItem.submenu = sm
+            menu.addItem(styleItem)
+        }
+
         // 被遗忘最久的窗口，点一下把它的 App 叫回前台
         let forgotten = fader.snapshot
             .map { ($0, fader.idleSeconds(of: $0.id)) }
@@ -67,6 +79,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func pickSpeed(_ sender: NSMenuItem) {
         if let raw = sender.representedObject as? String, let s = FadeSpeed(rawValue: raw) { fader.speed = s }
+    }
+
+    @objc private func pickStyle(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let st = FadeStyle(rawValue: raw) { fader.style = st }
     }
 
     @objc private func bringBack(_ sender: NSMenuItem) {
