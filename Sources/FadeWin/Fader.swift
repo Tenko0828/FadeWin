@@ -157,7 +157,12 @@ final class Fader {
         // 否则窗口会先盖住雾层（一下变清晰），下一次轮询雾层又盖回来（一下变模糊），就是闪
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.mouseDown() }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
-                                                          object: nil, queue: .main) { [weak self] _ in self?.poll() }
+                                                          object: nil, queue: .main) { [weak self] note in
+            // 切到访达以外的 App，“停在桌面上”的状态就结束了
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            if app?.bundleIdentifier != Self.finder { self?.onDesktop = false }
+            self?.poll()
+        }
     }
 
     @available(macOS 14, *)
@@ -170,6 +175,11 @@ final class Fader {
         lastAnim = Date()
     }
 
+    static let finder = "com.apple.finder"
+    /// 最近一次点击落在桌面上、并且之后还没点过任何窗口。
+    /// 这时前台虽然是访达，但用户在用的是桌面，访达的窗口不该算“正在用”
+    private var onDesktop = false
+
     private func mouseDown() {
         boostUntil = Date().addingTimeInterval(1.5)
         let p = NSEvent.mouseLocation
@@ -180,7 +190,10 @@ final class Fader {
         // 按真实层级找最上面那个被点中的普通窗口或面板（跳过我们自己的雾层）。
         // 不能用所有窗口：Dock 是一张盖满全屏的透明窗口，排在最前面，会把所有点击都“接走”
         let mine = Set(overlays.values.map { CGWindowID($0.windowNumber) })
-        guard let hit = allFrames.first(where: { $0.opaque && !mine.contains($0.id) && $0.bounds.contains(pt) }),
+        let hitAny = allFrames.first(where: { $0.opaque && !mine.contains($0.id) && $0.bounds.contains(pt) })
+        // 没点中任何窗口 = 点在桌面上（系统会把访达切到前台，但用户并没有在用访达的窗口）
+        onDesktop = hitAny == nil
+        guard let hit = hitAny,
               let w = snapshot.first(where: { $0.id == hit.id }),
               let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
         lastFocus[w.id] = Date()
@@ -229,6 +242,7 @@ final class Fader {
         let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         // 和“正在用”同一个标准：排在最前面的普通窗口属于前台 App 才算；
         // 点过桌面时前台是访达，但它的窗口可能压在后面，不能拿来锁
+        if onDesktop, NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.finder { return nil }
         if let w = snapshot.first(where: { $0.layer == 0 }), w.pid == pid { return w }
         return snapshot.first { $0.layer != 0 && $0.pid == pid }
     }
@@ -375,8 +389,10 @@ final class Fader {
         // 点桌面时访达会变成前台 App，但它的窗口可能压在别的窗口后面，不能算。
         // 普通窗口和面板分开看：别的 App 的常驻浮窗挡在最前面，不影响普通窗口里谁是“正在用”；
         // 前台 App 自己的面板（比如设置窗口）在最前面时，它也算正在用
-        let focusedID: CGWindowID? = wins.first(where: { $0.layer == 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
-        let focusedPanel: CGWindowID? = wins.first(where: { $0.layer != 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
+        // 点过桌面、前台变成访达时：访达最上面那个窗口并没有在用，不算
+        let desktopOnly = onDesktop && NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.finder
+        let focusedID: CGWindowID? = desktopOnly ? nil : wins.first(where: { $0.layer == 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
+        let focusedPanel: CGWindowID? = desktopOnly ? nil : wins.first(where: { $0.layer != 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
         if let focusedID { lastFocus[focusedID] = now }
         if let focusedPanel { lastFocus[focusedPanel] = now }
         let alive = Set(wins.map(\.id))
