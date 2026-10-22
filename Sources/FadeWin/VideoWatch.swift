@@ -1,11 +1,9 @@
 import AppKit
-import CoreAudio
 import IOKit.pwr_mgt
 
-/// 找出“正在播放视频”的 App，两路信号：
-/// 1. 向系统申请“别让屏幕休眠”的（不少播放器和网页会申请，但不可靠：Chrome 在窗口被挡住时就撤销了）；
-/// 2. 正在出声的（有声视频都会出声；顺带音乐播放器也不褪色）。
-/// 静音视频靠 MotionWatch 看画面在不在动。
+/// 找出“正在播放视频”的 App：向系统申请“别让屏幕休眠”的（哔哩哔哩客户端、Chrome 等会申请 “Video Wake Lock”）。
+/// 这一路不全：有的播放器不申请，Chrome 窗口被挡住时会撤销，所以还要靠 MotionWatch 看画面在不在动。
+/// 不用“正在出声”判断：Electron 类 App 常常没声音也一直开着音频通道，会误判它们在放视频
 /// 浏览器的视频往往由辅助进程（如 WebKit GPU 进程）申请，所以要追溯到它所属的 App
 enum VideoWatch {
     private typealias ResponsibleFn = @convention(c) (pid_t) -> pid_t
@@ -35,33 +33,7 @@ enum VideoWatch {
                 out.insert(owner(of: k.int32Value))
             }
         }
-        out.formUnion(audioPids())
         out.remove(me)
-        return out
-    }
-
-    /// 正在往扬声器出声的 App（macOS 14.2+ 才有这个接口）。浏览器的声音由辅助进程发出，同样追溯回浏览器本体
-    static func audioPids() -> Set<pid_t> {
-        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
-                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var size: UInt32 = 0
-        let sys = AudioObjectID(kAudioObjectSystemObject)
-        guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
-        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return [] }
-        var out = Set<pid_t>()
-        for id in ids {
-            var running: UInt32 = 0
-            var pid: pid_t = 0
-            var a = AudioObjectPropertyAddress(mSelector: kAudioProcessPropertyIsRunningOutput,
-                                               mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-            var s = UInt32(MemoryLayout<UInt32>.size)
-            guard AudioObjectGetPropertyData(id, &a, 0, nil, &s, &running) == noErr, running != 0 else { continue }
-            a.mSelector = kAudioProcessPropertyPID
-            s = UInt32(MemoryLayout<pid_t>.size)
-            guard AudioObjectGetPropertyData(id, &a, 0, nil, &s, &pid) == noErr, pid > 0 else { continue }
-            out.insert(owner(of: pid))
-        }
         return out
     }
 }
