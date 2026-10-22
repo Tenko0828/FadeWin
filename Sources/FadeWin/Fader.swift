@@ -86,10 +86,23 @@ final class Fader {
     private var overlayStyle: FadeStyle?
     private lazy var seeThrough: SeeThrough = MainActor.assumeIsolated { SeeThrough() }
 
+    /// 每个窗口“应该”褪到多少（0...1，按闲置时间算），和“现在画出来”是多少；动画让后者平滑追上前者
+    private var targets: [CGWindowID: CGFloat] = [:]
+    private var shown: [CGWindowID: CGFloat] = [:]
+    private var animTimer: Timer?
+    private var lastAnim = Date()
+
+    /// 透视时窗口最多透明到这里，保留一点影子，免得彻底看不见
+    static let maxSeeThrough: CGFloat = 0.72
+
     func start() {
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+        // 窗口列表 10 次/秒；动画 60 帧/秒，只改透明度，开销很小
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
+        RunLoop.main.add(a, forMode: .common)
+        animTimer = a
     }
 
     func idleSeconds(of id: CGWindowID) -> Double {
@@ -98,14 +111,17 @@ final class Fader {
 
     // MARK: - 窗口列表
 
-    static func onScreenWindows() -> [WinInfo] {
+    /// 返回要处理的普通窗口，以及屏幕上所有窗口（含 Dock、菜单栏、我们自己的雾层）从前到后的顺序
+    static func onScreenWindows() -> (wins: [WinInfo], order: [CGWindowID]) {
         let me = ProcessInfo.processInfo.processIdentifier
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return ([], []) }
         var out: [WinInfo] = []
+        var order: [CGWindowID] = []
         for w in list {
+            guard let id = w[kCGWindowNumber as String] as? CGWindowID else { continue }
+            order.append(id)
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
-                  let id = w[kCGWindowNumber as String] as? CGWindowID,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != me,
                   let bd = w[kCGWindowBounds as String] as? NSDictionary,
                   let b = CGRect(dictionaryRepresentation: bd as CFDictionary),
@@ -114,14 +130,14 @@ final class Fader {
             if owner == "Window Server" || owner == "Dock" { continue }
             out.append(WinInfo(id: id, pid: pid, owner: owner, title: w[kCGWindowName as String] as? String ?? "", bounds: b))
         }
-        return out   // 从前到后
+        return (out, order)
     }
 
-    // MARK: - 每半秒一次
+    // MARK: - 每 0.1 秒：算目标、跟随窗口位置
 
-    private func tick() {
+    private func poll() {
         guard !paused else { return }
-        let wins = Self.onScreenWindows()
+        let (wins, order) = Self.onScreenWindows()
         snapshot = wins
         let now = Date()
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -135,60 +151,93 @@ final class Fader {
             win.orderOut(nil)
             overlays[id] = nil
         }
+        targets = targets.filter { alive.contains($0.key) }
+        shown = shown.filter { alive.contains($0.key) }
 
         let current = effectiveStyle
         if overlayStyle != current {
             clearOverlays()
             overlayStyle = current
         }
-        var seeTargets: [CGWindowID: (win: WinInfo, view: NSView)] = [:]
 
         let (grace, full) = speed.span
-        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let veil = dark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.94, alpha: 1)
         let screenH = NSScreen.screens.first?.frame.height ?? 0
-
-        defer {
-            if current == .seeThrough {
-                let ids = Set(overlays.values.map { CGWindowID($0.windowNumber) })
-                MainActor.assumeIsolated { seeThrough.sync(targets: seeTargets, overlayIDs: ids) }
-            }
-        }
+        var seeTargets: [CGWindowID: (win: WinInfo, view: NSView, overlay: CGWindowID)] = [:]
 
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
             let t = min(max((idle - grace) / (full - grace), 0), 1)
-            let alpha = Self.maxAlpha * CGFloat(1 - (1 - t) * (1 - t))   // 先快后慢：刚开始褪就能看出来
-            guard alpha > 0.01 else {
-                if let o = overlays[w.id] { o.orderOut(nil); overlays[w.id] = nil }
-                continue
-            }
+            let target = CGFloat(1 - (1 - t) * (1 - t))   // 先快后慢：刚开始褪就能看出来
+            targets[w.id] = target
+            // 目标归零后雾层还要留着，等动画把它淡出去再收
+            guard target > 0.002 || (shown[w.id] ?? 0) > 0.002 else { continue }
+
             let frame = NSRect(x: w.bounds.minX, y: screenH - w.bounds.maxY, width: w.bounds.width, height: w.bounds.height)
-            let win = overlays[w.id] ?? makeOverlay()
-            overlays[w.id] = win
-            win.setFrame(frame, display: false)
-            if current == .seeThrough, let v = win.contentView {
-                seeTargets[w.id] = (w, v)
-                let live = MainActor.assumeIsolated { seeThrough.isLive(w.id) }
-                let amount = alpha / Self.maxAlpha
-                if live {
-                    // 抓到了“窗口后面”的画面：雾层按比例变淡，窗口就像变透明了（留一点影子，免得彻底找不到）
-                    v.layer?.backgroundColor = nil
-                    win.alphaValue = 0.93 * amount
-                } else {
-                    // 还没抓到画面（刚开始、或超出同时抓取上限）：先用薄雾顶着
-                    win.alphaValue = 1
-                    v.layer?.backgroundColor = veil.withAlphaComponent(alpha).cgColor
-                }
+            let win: NSWindow
+            if let o = overlays[w.id] {
+                win = o
             } else {
-                apply(amount: alpha / Self.maxAlpha, veil: veil, to: win)
+                win = makeOverlay()
+                overlays[w.id] = win
+                shown[w.id] = 0
+                win.alphaValue = 0
             }
+            if win.frame != frame { win.setFrame(frame, display: false) }
             win.order(.above, relativeTo: Int(w.id))
+            if current == .seeThrough, let v = win.contentView { seeTargets[w.id] = (w, v, CGWindowID(win.windowNumber)) }
+        }
+
+        if current == .seeThrough {
+            MainActor.assumeIsolated { seeThrough.sync(targets: seeTargets, order: order) }
         }
     }
 
-    /// amount: 0...1，0 是刚开始褪，1 是褪到最浅
-    private func apply(amount: CGFloat, veil: NSColor, to win: NSWindow) {
+    // MARK: - 每帧：平滑过渡
+
+    private func animate() {
+        let now = Date()
+        let dt = min(now.timeIntervalSince(lastAnim), 0.1)
+        lastAnim = now
+        guard !overlays.isEmpty else { return }
+
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let veil = dark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.94, alpha: 1)
+        let current = overlayStyle ?? effectiveStyle
+
+        for (id, win) in overlays {
+            let target = targets[id] ?? 0
+            var s = shown[id] ?? 0
+            // 褪色慢慢跟上；回到前台时 0.2 秒左右快速恢复
+            let rate = target > s ? 2.5 : 14.0
+            s += (target - s) * CGFloat(1 - exp(-rate * dt))
+            if abs(target - s) < 0.002 { s = target }
+            shown[id] = s
+
+            if s <= 0.002, target <= 0.002 {
+                win.orderOut(nil)
+                overlays[id] = nil
+                shown[id] = 0
+                continue
+            }
+            apply(amount: s, id: id, style: current, veil: veil, to: win)
+        }
+    }
+
+    /// amount: 0...1，0 是没褪，1 是褪到最浅
+    private func apply(amount: CGFloat, id: CGWindowID, style: FadeStyle, veil: NSColor, to win: NSWindow) {
+        if style == .seeThrough, let v = win.contentView {
+            if MainActor.assumeIsolated({ seeThrough.isLive(id) }) {
+                // 盖上“窗口后面”的实时画面，再按比例变淡：看起来就是窗口本身变透明了
+                v.layer?.backgroundColor = nil
+                win.alphaValue = Self.maxSeeThrough * amount
+            } else {
+                // 还没抓到画面（刚开始，或超过同时抓取上限）：先用薄雾顶着
+                v.layer?.backgroundColor = veil.cgColor
+                win.alphaValue = Self.maxAlpha * amount
+            }
+            return
+        }
+        win.alphaValue = 1
         if #available(macOS 26, *), let glass = win.contentView as? NSGlassEffectView {
             // 玻璃本身随时间变厚；染色让它在浅色/深色下都不发灰
             glass.alphaValue = min(1, amount * 1.4)
@@ -205,6 +254,7 @@ final class Fader {
         win.hasShadow = false
         win.ignoresMouseEvents = true
         win.isReleasedWhenClosed = false
+        win.animationBehavior = .none
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
         if #available(macOS 26, *), effectiveStyle == .glass {
             let glass = NSGlassEffectView()
@@ -226,5 +276,6 @@ final class Fader {
         MainActor.assumeIsolated { seeThrough.stopAll() }
         overlays.values.forEach { $0.orderOut(nil) }
         overlays.removeAll()
+        shown.removeAll()
     }
 }

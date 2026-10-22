@@ -60,26 +60,35 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         replicas.removeAll()
     }
 
-    /// 每个 tick 调一次：targets 是正在褪色的窗口和它们的雾层视图，overlayIDs 是所有雾层窗口（抓取时要排除）
-    func sync(targets: [CGWindowID: (win: WinInfo, view: NSView)], overlayIDs: Set<CGWindowID>) {
+    /// 每次轮询调一次：targets 是正在褪色的窗口和它们的雾层视图，order 是屏幕上所有窗口从前到后的顺序。
+    /// 一个窗口的“后面”= 屏幕去掉它自己以及所有在它前面的窗口（含 Dock、菜单栏、前面窗口的雾层）。
+    /// 这样后面窗口的雾层里不会混进前面窗口的旧画面，叠在一起的窗口各褪各的
+    func sync(targets: [CGWindowID: (win: WinInfo, view: NSView, overlay: CGWindowID)], order: [CGWindowID]) {
         for id in replicas.keys where targets[id] == nil {
             if let r = replicas.removeValue(forKey: id) { Task { try? await r.stream.stopCapture() } }
         }
         guard !targets.isEmpty else { return }
 
-        let needed = Set(targets.keys).union(overlayIDs)
+        var front: [CGWindowID: Set<CGWindowID>] = [:]
+        for (id, t) in targets {
+            guard let idx = order.firstIndex(of: id) else { continue }
+            // 刚建的雾层可能还没出现在 order 里，直接把它也排除，免得抓到自己
+            front[id] = Set(order[...idx]).union([t.overlay])
+        }
+        let needed = front.values.reduce(into: Set<CGWindowID>()) { $0.formUnion($1) }
         let known = Set((content?.windows ?? []).map(\.windowID))
         if !needed.isSubset(of: known) || Date().timeIntervalSince(contentDate) > 5 { refresh() }
         guard let content else { return }
 
         for (id, t) in targets {
+            guard let wanted = front[id]?.intersection(known) else { continue }
             if let r = replicas[id] {
                 guard !r.updating else { continue }
-                if r.bounds != t.win.bounds || r.excluded != overlayIDs.union([id]) {
-                    update(r, id: id, bounds: t.win.bounds, overlayIDs: overlayIDs, content: content)
+                if r.bounds != t.win.bounds || r.excluded != wanted {
+                    update(r, bounds: t.win.bounds, excluding: wanted, content: content)
                 }
             } else if !starting.contains(id), replicas.count + starting.count < Self.maxReplicas {
-                start(id: id, win: t.win, view: t.view, overlayIDs: overlayIDs, content: content)
+                start(id: id, win: t.win, view: t.view, excluding: wanted, content: content)
             }
         }
     }
@@ -107,7 +116,8 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func config(bounds: CGRect, display: SCDisplay) -> SCStreamConfiguration {
         let cfg = SCStreamConfiguration()
-        let s = scale(of: display)
+        // 透出来的画面本来就是半透明的，不必满分辨率：每路最多约 220 万像素，同时开多路也不卡
+        let s = min(scale(of: display), sqrt(2_200_000 / max(bounds.width * bounds.height, 1)))
         cfg.sourceRect = CGRect(x: bounds.minX - display.frame.minX, y: bounds.minY - display.frame.minY,
                                 width: bounds.width, height: bounds.height)
         cfg.width = max(Int(bounds.width * s), 2)
@@ -116,7 +126,7 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         cfg.showsCursor = false
         cfg.scalesToFit = true
         cfg.queueDepth = 3
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 20)
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: replicas.count >= 3 ? 15 : 30)
         return cfg
     }
 
@@ -124,9 +134,8 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         SCContentFilter(display: display, excludingWindows: content.windows.filter { ids.contains($0.windowID) })
     }
 
-    private func start(id: CGWindowID, win: WinInfo, view: NSView, overlayIDs: Set<CGWindowID>, content: SCShareableContent) {
+    private func start(id: CGWindowID, win: WinInfo, view: NSView, excluding excluded: Set<CGWindowID>, content: SCShareableContent) {
         guard let disp = display(for: win.bounds, in: content) else { return }
-        let excluded = overlayIDs.union([id])
         let stream = SCStream(filter: filter(display: disp, excluding: excluded, content: content),
                               configuration: config(bounds: win.bounds, display: disp), delegate: nil)
         let replica = Replica(stream: stream, view: view, bounds: win.bounds, excluded: excluded)
@@ -146,10 +155,9 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    private func update(_ r: Replica, id: CGWindowID, bounds: CGRect, overlayIDs: Set<CGWindowID>, content: SCShareableContent) {
+    private func update(_ r: Replica, bounds: CGRect, excluding excluded: Set<CGWindowID>, content: SCShareableContent) {
         guard let disp = display(for: bounds, in: content) else { return }
         r.updating = true
-        let excluded = overlayIDs.union([id])
         let cfg = config(bounds: bounds, display: disp)
         let flt = filter(display: disp, excluding: excluded, content: content)
         Task { @MainActor in
