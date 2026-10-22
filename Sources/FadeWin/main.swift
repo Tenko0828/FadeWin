@@ -164,6 +164,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < Comman
     exit(0)
 }
 
+if CommandLine.arguments.contains("--check-permission") {
+    print("screen capture permission:", SeeThrough.hasPermission)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--enable-login-item") {
     do {
         if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
