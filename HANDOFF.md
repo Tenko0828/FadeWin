@@ -18,7 +18,7 @@
 
 macOS 菜单栏小工具：**窗口越久没碰越淡，点一下恢复**。
 
-- 位置：`~/FadeWin`（Swift Package，无 Xcode 工程）
+- 位置：`~/Documents/大肥鱼の家/FadeWin`（Swift Package，无 Xcode 工程）
 - 系统：macOS 27.0.1，SDK 26.5，只装了 Command Line Tools（**没有 `metal` 编译器**）
 - 安装后：`/Applications/FadeWin.app`，开机自启，Bundle ID `local.tenko.fadewin`
 - 用户当前设置：外观＝透视（`seeThrough`），速度＝快（`fast`），隐私薄雾＝开
@@ -105,8 +105,8 @@ macOS 菜单栏小工具：**窗口越久没碰越淡，点一下恢复**。
 ## 3. 编译、安装、权限
 
 ```bash
-cd ~/FadeWin && swift build                 # 只编译，看有没有错
-cd ~/FadeWin && ./build.sh install          # 打包、签名、装进 /Applications 并重启
+cd ~/Documents/大肥鱼の家/FadeWin && swift build                 # 只编译，看有没有错
+cd ~/Documents/大肥鱼の家/FadeWin && ./build.sh install          # 打包、签名、装进 /Applications 并重启
 ```
 
 - 签名是 ad-hoc，但 `build.sh` 用了固定的签名要求 `designated => identifier "local.tenko.fadewin"`。**实测重新编译后屏幕录制授权仍然有效**，不要去掉这一行，否则每次重编都要用户重新授权。
