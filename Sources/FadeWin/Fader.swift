@@ -163,6 +163,60 @@ final class Fader {
         win.orderFront(nil)
     }
 
+    // MARK: - 锁定、例外、全部恢复
+
+    /// 本次运行里锁定的窗口。窗口编号重启后会变，所以不存盘
+    private(set) var lockedWindows: Set<CGWindowID> = []
+
+    /// 永不褪色的 App，按 Bundle ID 存盘
+    var exemptApps: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "exemptApps") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: "exemptApps") }
+    }
+
+    private var bundleIDs: [pid_t: String] = [:]
+
+    func bundleID(of pid: pid_t) -> String? {
+        if let b = bundleIDs[pid] { return b }
+        let b = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        if let b { bundleIDs[pid] = b }
+        return b
+    }
+
+    /// 用户正在用的窗口。点菜单栏图标不会切换前台 App，所以打开菜单时这就是用户刚才在用的那个
+    var frontWindow: WinInfo? {
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        return snapshot.first { $0.pid == pid }
+    }
+
+    func isLocked(_ id: CGWindowID) -> Bool { lockedWindows.contains(id) }
+
+    func toggleLock(_ id: CGWindowID) {
+        if lockedWindows.remove(id) == nil { lockedWindows.insert(id) }
+        lastFocus[id] = Date()   // 解锁后从清晰开始重新计时
+    }
+
+    /// 锁定/解锁当前窗口，返回操作后是否处于锁定状态；没有可操作的窗口时返回 nil
+    @discardableResult
+    func toggleLockFrontWindow() -> Bool? {
+        guard let w = frontWindow else { return nil }
+        toggleLock(w.id)
+        return isLocked(w.id)
+    }
+
+    /// 所有窗口立刻恢复清晰，并从现在重新计时
+    func restoreAll() {
+        let now = Date()
+        for id in lastFocus.keys { lastFocus[id] = now }
+    }
+
+    /// 锁定的窗口、例外 App 的窗口都不褪色
+    private func isExempt(_ w: WinInfo) -> Bool {
+        if lockedWindows.contains(w.id) { return true }
+        if let b = bundleID(of: w.pid), exemptApps.contains(b) { return true }
+        return false
+    }
+
     func idleSeconds(of id: CGWindowID) -> Double {
         lastFocus[id].map { Date().timeIntervalSince($0) } ?? 0
     }
@@ -234,12 +288,14 @@ final class Fader {
         let focusedID: CGWindowID? = wins.first.flatMap { $0.pid == frontPid ? $0.id : nil }
         if let focusedID { lastFocus[focusedID] = now }
         let alive = Set(wins.map(\.id))
-        for w in wins where lastFocus[w.id] == nil { lastFocus[w.id] = now }
+        for w in wins where lastFocus[w.id] == nil || isExempt(w) { lastFocus[w.id] = now }
         // 不在屏幕上的窗口（切到别的桌面空间、最小化）保留计时，回来时接着褪；每 10 秒清一次已经关掉的
         pollCount += 1
         if pollCount % 300 == 0, let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
             let exists = Set(all.compactMap { $0[kCGWindowNumber as String] as? CGWindowID })
             lastFocus = lastFocus.filter { exists.contains($0.key) }
+            lockedWindows.formIntersection(exists)
+            bundleIDs.removeAll()
         }
         for (id, win) in overlays where !alive.contains(id) {
             win.orderOut(nil)
