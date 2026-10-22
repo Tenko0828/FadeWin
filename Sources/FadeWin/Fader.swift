@@ -492,10 +492,10 @@ final class Fader {
                 v.base.opacity = Float(Self.maxSeeThrough * amount)
                 v.rim.opacity = Float(min(1, amount * 1.6))
             } else {
-                // 还没抓到画面（刚开始，或超过同时抓取上限）：先用薄雾顶着
-                win.alphaValue = Self.maxAlpha * amount
-                v.layer?.backgroundColor = veil.cgColor
-                v.frost.alphaValue = 0
+                // 还没抓到画面（刚开始，或没分到抓取名额）：用磨砂玻璃顶着，样子接近透视，不会是一片白
+                win.alphaValue = 1
+                v.layer?.backgroundColor = veil.withAlphaComponent(0.3 * amount).cgColor
+                v.frost.alphaValue = min(1, amount * 1.3)
                 v.base.opacity = 0
                 v.rim.opacity = 0
             }

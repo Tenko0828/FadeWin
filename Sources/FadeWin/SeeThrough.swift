@@ -101,7 +101,10 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
 }
 
 @MainActor final class SeeThrough {
-    static let maxReplicas = 6
+    /// 最多同时抓几个窗口。名额按前后顺序分，排在前面（看得见）的优先
+    static let maxReplicas = 8
+    /// 排名掉到这之后才收回名额，避免窗口顺序稍一变动就来回开关抓取
+    static let keepRank = maxReplicas + 2
 
     private var content: SCShareableContent?
     private var contentDate = Date.distantPast
@@ -131,7 +134,11 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 一个窗口的“后面”= 屏幕去掉它自己以及所有在它前面的窗口（含 Dock、菜单栏、前面窗口的雾层）。
     /// 这样后面窗口的雾层里不会混进前面窗口的旧画面，叠在一起的窗口各褪各的
     func sync(targets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges)], order: [CGWindowID]) {
-        for id in replicas.keys where targets[id] == nil {
+        // 按前后顺序排名：新打开、排在前面的窗口可以从最后面的窗口那里接过名额
+        let rank: [CGWindowID: Int] = Dictionary(uniqueKeysWithValues: targets.keys
+            .sorted { (order.firstIndex(of: $0) ?? .max) < (order.firstIndex(of: $1) ?? .max) }
+            .enumerated().map { ($1, $0) })
+        for id in replicas.keys where targets[id] == nil || (rank[id] ?? .max) >= Self.keepRank && targets[id]?.frozen != true {
             if let r = replicas.removeValue(forKey: id) { Task { try? await r.stream.stopCapture() } }
         }
         guard !targets.isEmpty else { return }
@@ -156,7 +163,8 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
                 if r.bounds != t.win.bounds || r.excluded != wanted {
                     update(r, bounds: t.win.bounds, excluding: wanted, content: content)
                 }
-            } else if !t.frozen, !starting.contains(id), replicas.count + starting.count < Self.maxReplicas {
+            } else if !t.frozen, !starting.contains(id), (rank[id] ?? .max) < Self.maxReplicas,
+                      replicas.count + starting.count < Self.keepRank {
                 start(id: id, win: t.win, view: t.view, excluding: wanted, edges: t.edges, content: content)
             }
         }
