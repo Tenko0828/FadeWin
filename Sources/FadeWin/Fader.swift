@@ -384,9 +384,10 @@ final class Fader {
             videoPids = VideoWatch.playingPids()
             videoChecked = now
         }
-        // 盯着快要褪色的窗口看画面在不在动（前面的优先）；需要屏幕录制权限。
+        // 盯着快要褪色的窗口看画面在不在动（前面的优先）。只在透视外观下做：
+        // 这要用屏幕抓取，系统会亮起录屏指示；用户选玻璃或薄雾就是不想抓屏，那时只靠“防休眠申请”识别视频。
         // 被认定在动的窗口闲置时间会一直被清零，所以“最近 10 秒在动过”的也要接着盯，不然会探头一关它就褪、一褪又被探到，来回折腾
-        if permissionCached {
+        if permissionCached, effectiveStyle == .seeThrough {
             let grace = speed.span.grace
             let overlayIDs = Set(overlays.values.map { CGWindowID($0.windowNumber) })
             let watch = wins.filter { w in
@@ -402,7 +403,10 @@ final class Fader {
             }
             for id in movingWindows { lastMotion[id] = now }
         } else {
+            // 从透视切走时把探头全停掉，录屏指示才会消失
+            if !movingWindows.isEmpty || !lastMotion.isEmpty { lastMotion.removeAll() }
             movingWindows = []
+            MainActor.assumeIsolated { motion.stopAll() }
         }
         for w in wins where lastFocus[w.id] == nil || isExempt(w) { lastFocus[w.id] = now }
         // 不在屏幕上的窗口（切到别的桌面空间、最小化）保留计时，回来时接着褪；每 10 秒清一次已经关掉的
