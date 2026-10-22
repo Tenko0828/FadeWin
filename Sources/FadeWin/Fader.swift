@@ -63,7 +63,13 @@ final class Fader {
         get { UserDefaults.standard.bool(forKey: "paused") }
         set {
             UserDefaults.standard.set(newValue, forKey: "paused")
-            if newValue { clearOverlays() } else { lastFocus.removeAll() }   // 暂停期间不算闲置
+            if newValue {
+                clearOverlays()
+                MainActor.assumeIsolated { motion.stopAll() }
+                movingWindows = []
+            } else {
+                lastFocus.removeAll()   // 暂停期间不算闲置
+            }
         }
     }
 
@@ -135,11 +141,12 @@ final class Fader {
         RunLoop.main.add(t, forMode: .common)
         timer = t
         // 动画跟着屏幕刷新走（120 Hz 屏上就是 120 帧）；macOS 13 没有这个接口，退回 60 Hz 计时器
-        if #available(macOS 14, *), let screen = NSScreen.main {
-            let link = screen.displayLink(target: frameTicker, selector: #selector(FrameTicker.tick))
-            link.add(to: .main, forMode: .common)
-            displayLink = link
+        if #available(macOS 14, *) {
             frameTicker.onTick = { [weak self] in self?.animate() }
+            makeDisplayLink()
+            // 刷新回调绑在某块屏幕上：接上/拔掉显示器后那块屏幕可能没了，回调就停了，要重建
+            NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                   object: nil, queue: .main) { [weak self] _ in self?.makeDisplayLink() }
         } else {
             let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
             RunLoop.main.add(a, forMode: .common)
@@ -151,6 +158,16 @@ final class Fader {
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.mouseDown() }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
                                                           object: nil, queue: .main) { [weak self] _ in self?.poll() }
+    }
+
+    @available(macOS 14, *)
+    private func makeDisplayLink() {
+        (displayLink as? CADisplayLink)?.invalidate()
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { displayLink = nil; return }
+        let link = screen.displayLink(target: frameTicker, selector: #selector(FrameTicker.tick))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        lastAnim = Date()
     }
 
     private func mouseDown() {
@@ -185,9 +202,9 @@ final class Fader {
     private(set) var lockedWindows: Set<CGWindowID> = []
 
     /// 永不褪色的 App，按 Bundle ID 存盘
-    var exemptApps: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: "exemptApps") ?? []) }
-        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: "exemptApps") }
+    /// 每次轮询每个窗口都要查，所以缓存在内存里，只在改动时写盘
+    lazy var exemptApps: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "exemptApps") ?? []) {
+        didSet { UserDefaults.standard.set(Array(exemptApps).sorted(), forKey: "exemptApps") }
     }
 
     private var bundleIDs: [pid_t: String] = [:]
@@ -198,6 +215,7 @@ final class Fader {
     private(set) var movingWindows: Set<CGWindowID> = []
     private lazy var motion: MotionWatch = MainActor.assumeIsolated { MotionWatch() }
     private var videoChecked = Date.distantPast
+    private var lastMotion: [CGWindowID: Date] = [:]
 
     func bundleID(of pid: pid_t) -> String? {
         if let b = bundleIDs[pid] { return b }
@@ -209,7 +227,10 @@ final class Fader {
     /// 用户正在用的窗口。点菜单栏图标不会切换前台 App，所以打开菜单时这就是用户刚才在用的那个
     var frontWindow: WinInfo? {
         let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        return snapshot.first { $0.pid == pid }
+        // 和“正在用”同一个标准：排在最前面的普通窗口属于前台 App 才算；
+        // 点过桌面时前台是访达，但它的窗口可能压在后面，不能拿来锁
+        if let w = snapshot.first(where: { $0.layer == 0 }), w.pid == pid { return w }
+        return snapshot.first { $0.layer != 0 && $0.pid == pid }
     }
 
     func isLocked(_ id: CGWindowID) -> Bool { lockedWindows.contains(id) }
@@ -363,14 +384,23 @@ final class Fader {
             videoPids = VideoWatch.playingPids()
             videoChecked = now
         }
-        // 盯着不是“正在用”的窗口看画面在不在动（前面的优先）；需要屏幕录制权限
+        // 盯着快要褪色的窗口看画面在不在动（前面的优先）；需要屏幕录制权限。
+        // 被认定在动的窗口闲置时间会一直被清零，所以“最近 10 秒在动过”的也要接着盯，不然会探头一关它就褪、一褪又被探到，来回折腾
         if permissionCached {
-            let watch = wins.filter { $0.id != focusedID && !lockedWindows.contains($0.id) && !videoPids.contains($0.pid)
-                && !Self.isFullyCovered($0.bounds, by: frames, before: $0.id, ignoring: Set(overlays.values.map { CGWindowID($0.windowNumber) })) }.map(\.id)
+            let grace = speed.span.grace
+            let overlayIDs = Set(overlays.values.map { CGWindowID($0.windowNumber) })
+            let watch = wins.filter { w in
+                guard w.id != focusedID, !lockedWindows.contains(w.id), !videoPids.contains(w.pid) else { return false }
+                let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
+                let recentlyMoving = now.timeIntervalSince(lastMotion[w.id] ?? .distantPast) < 10
+                guard idle >= grace * 0.5 || recentlyMoving else { return false }
+                return !Self.isFullyCovered(w.bounds, by: frames, before: w.id, ignoring: overlayIDs)
+            }.map(\.id)
             movingWindows = MainActor.assumeIsolated {
                 motion.sync(candidates: watch)
                 return Set(watch.filter { motion.isMoving($0) })
             }
+            for id in movingWindows { lastMotion[id] = now }
         } else {
             movingWindows = []
         }
@@ -391,6 +421,7 @@ final class Fader {
         targets = targets.filter { alive.contains($0.key) }
         shown = shown.filter { alive.contains($0.key) }
         lastMoved = lastMoved.filter { alive.contains($0.key) }
+        lastMotion = lastMotion.filter { alive.contains($0.key) }
         vis = vis.filter { alive.contains($0.key) }
 
         let current = effectiveStyle

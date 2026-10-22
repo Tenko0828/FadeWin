@@ -138,8 +138,10 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         let rank: [CGWindowID: Int] = Dictionary(uniqueKeysWithValues: targets.keys
             .sorted { (order.firstIndex(of: $0) ?? .max) < (order.firstIndex(of: $1) ?? .max) }
             .enumerated().map { ($1, $0) })
-        // 被前面窗口完全挡住的窗口看不见，也停掉抓取
+        // 被前面窗口完全挡住的窗口看不见，也停掉抓取；
+        // 雾层被重建过的（抓取还连着旧视图），也停掉重来，不然新雾层会是空的
         for id in replicas.keys where targets[id] == nil
+            || replicas[id]?.view !== targets[id]?.view
             || ((rank[id] ?? .max) >= Self.keepRank || targets[id]?.covered == true) && targets[id]?.frozen != true {
             if let r = replicas.removeValue(forKey: id) { Task { try? await r.stream.stopCapture() } }
         }
@@ -244,11 +246,20 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         Task { @MainActor in
             defer { r.updating = false }
             let moved = r.bounds != bounds
-            if moved {
-                r.expect(cfg)
-                try? await r.stream.updateConfiguration(cfg)
+            do {
+                if moved {
+                    r.expect(cfg)
+                    try await r.stream.updateConfiguration(cfg)
+                }
+                try await r.stream.updateContentFilter(flt)
+            } catch {
+                // 改不成功就丢掉这路抓取，下一轮重开；不然它会一直等一帧永远不来的新画面，窗口就一直不褪
+                if replicas.first(where: { $0.value === r }) != nil {
+                    replicas = replicas.filter { $0.value !== r }
+                    Task { try? await r.stream.stopCapture() }
+                }
+                return
             }
-            try? await r.stream.updateContentFilter(flt)
             r.bounds = bounds
             r.excluded = excluded
             // 只有位置/尺寸变了才要等新画面；只是层级变了（点了别的窗口）就接着用，免得闪
