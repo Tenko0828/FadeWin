@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let fader = Fader()
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
+    private let hud = Hud()
+    private var hotkeys: Hotkeys?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -14,11 +16,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         fader.start()
+        hotkeys = Hotkeys { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .pause: self.togglePause()
+            case .restore: self.restoreAllWindows()
+            case .lock: self.toggleLockCurrentWindow()
+            }
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        menu.addItem(item("暂停褪色", #selector(togglePause), on: fader.paused))
+        menu.addItem(hotkeyItem("暂停褪色", #selector(togglePause), key: "p", on: fader.paused))
+        menu.addItem(hotkeyItem("所有窗口立刻恢复", #selector(restoreAllWindows), key: "r"))
+        let front = fader.frontWindow
+        let lockTitle = front.map { "锁定当前窗口：\($0.owner)" } ?? "锁定当前窗口"
+        menu.addItem(hotkeyItem(lockTitle, #selector(toggleLockCurrentWindow), key: "l",
+                               on: front.map { fader.isLocked($0.id) } ?? false))
 
         let speedItem = NSMenuItem(title: "褪色速度", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -82,7 +97,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return mi
     }
 
-    @objc private func togglePause() { fader.paused.toggle() }
+    private func hotkeyItem(_ title: String, _ sel: Selector, key: String, on: Bool = false) -> NSMenuItem {
+        let mi = item(title, sel, key: key, on: on)
+        mi.keyEquivalentModifierMask = [.option, .command]
+        return mi
+    }
+
+    @objc private func togglePause() {
+        fader.paused.toggle()
+        hud.show(fader.paused ? "已暂停褪色" : "已继续褪色")
+    }
+
+    @objc private func restoreAllWindows() {
+        fader.restoreAll()
+        hud.show("所有窗口已恢复")
+    }
+
+    @objc private func toggleLockCurrentWindow() {
+        let owner = fader.frontWindow?.owner ?? ""
+        guard let locked = fader.toggleLockFrontWindow() else {
+            hud.show("没有可锁定的窗口")
+            return
+        }
+        hud.show(locked ? "已锁定：\(owner)" : "已解锁：\(owner)")
+    }
 
     @objc private func pickSpeed(_ sender: NSMenuItem) {
         if let raw = sender.representedObject as? String, let s = FadeSpeed(rawValue: raw) { fader.speed = s }

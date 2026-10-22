@@ -1,6 +1,7 @@
 import AppKit
 import CoreMedia
 import ScreenCaptureKit
+import os
 
 /// 一个窗口的“后面”：实时抓取去掉这个窗口之后的屏幕，贴在窗口上方的雾层里。
 /// 雾层再按比例变透明，叠起来的效果就是这个窗口本身变透明了
@@ -13,16 +14,27 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     private var rimPool: [IOSurface] = []
     private var rimIndex = 0
     private(set) var live = false
-    var bounds: CGRect
+    // 抓取线程只需要这两个值；一起取快照，避免画边框时和主线程争读写
+    private struct CaptureGeometry {
+        var width: CGFloat
+        var edges: Edges = .all
+    }
+    private let geometry: OSAllocatedUnfairLock<CaptureGeometry>
+    var bounds: CGRect {
+        didSet { geometry.withLock { $0.width = bounds.width } }
+    }
     var excluded: Set<CGWindowID>
-    /// 哪几条边是真边；在主线程改，抓取线程读（偶尔读到旧值只影响一帧）
-    var edges: Edges = .all
+    var edges: Edges {
+        get { geometry.withLock { $0.edges } }
+        set { geometry.withLock { $0.edges = newValue } }
+    }
     var updating = false
     var onStop: (() -> Void)?
 
     init(filter: SCContentFilter, config: SCStreamConfiguration, view: SeeView, bounds: CGRect, excluded: Set<CGWindowID>) {
         self.view = view
         self.bounds = bounds
+        geometry = OSAllocatedUnfairLock(initialState: CaptureGeometry(width: bounds.width))
         self.excluded = excluded
         expectedSize = (config.width, config.height)
         super.init()
@@ -42,6 +54,7 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
 
         // 在抓取线程上把边框画好，主线程只负责换图
+        let geometry = geometry.withLock { $0 }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
         if rimPool.first.map({ $0.width != w || $0.height != h }) ?? true {
             rimPool = (0..<3).compactMap { _ in GlassRim.makeSurface(width: w, height: h) }
@@ -50,8 +63,8 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         if rimPool.count == 3 {
             let dest = rimPool[rimIndex]
             rimIndex = (rimIndex + 1) % 3
-            let scale = CGFloat(w) / max(bounds.width, 1)
-            if GlassRim.render(surface, scale: scale, edges: edges, into: dest) { rimSurface = dest }
+            let scale = CGFloat(w) / max(geometry.width, 1)
+            if GlassRim.render(surface, scale: scale, edges: geometry.edges, into: dest) { rimSurface = dest }
         }
 
         DispatchQueue.main.async { [weak self] in
