@@ -49,6 +49,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        addExemptionItems(to: menu)
+
         // 被遗忘最久的窗口，点一下把它的 App 叫回前台
         let forgotten = fader.snapshot
             .map { ($0, fader.idleSeconds(of: $0.id)) }
@@ -136,6 +138,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// MARK: - 不褪色的窗口和 App
+
+extension AppDelegate {
+    func addExemptionItems(to menu: NSMenu) {
+        menu.addItem(.separator())
+
+        // 正在放视频的 App：自动不褪色，这里只是告诉用户
+        let playing = Set(fader.snapshot.filter { fader.videoPids.contains($0.pid) }.map(\.owner)).sorted()
+        if !playing.isEmpty {
+            let mi = NSMenuItem(title: "正在播放视频，暂不褪色：\(playing.joined(separator: "、"))", action: nil, keyEquivalent: "")
+            mi.isEnabled = false
+            menu.addItem(mi)
+        }
+
+        if let w = fader.frontWindow, let bid = fader.bundleID(of: w.pid) {
+            let mi = item("「\(w.owner)」永不褪色", #selector(toggleExemptApp(_:)), on: fader.exemptApps.contains(bid))
+            mi.representedObject = bid
+            menu.addItem(mi)
+        }
+
+        // 已锁定的窗口和永不褪色的 App，点一下取消
+        let locked = fader.snapshot.filter { fader.isLocked($0.id) }
+        let apps = fader.exemptApps.sorted()
+        guard !locked.isEmpty || !apps.isEmpty else { return }
+        let listItem = NSMenuItem(title: "不褪色的窗口和 App（\(locked.count + apps.count)）", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for w in locked {
+            let name = w.title.isEmpty ? w.owner : "\(w.owner) · \(w.title.prefix(24))"
+            let mi = item("🔒 \(name)　点击解锁", #selector(unlockWindow(_:)))
+            mi.representedObject = Int(w.id)
+            sub.addItem(mi)
+        }
+        if !locked.isEmpty, !apps.isEmpty { sub.addItem(.separator()) }
+        for bid in apps {
+            let name = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid)
+                .map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") } ?? bid
+            let mi = item("「\(name)」永不褪色　点击取消", #selector(toggleExemptApp(_:)))
+            mi.representedObject = bid
+            sub.addItem(mi)
+        }
+        listItem.submenu = sub
+        menu.addItem(listItem)
+    }
+
+    @objc func toggleExemptApp(_ sender: NSMenuItem) {
+        guard let bid = sender.representedObject as? String else { return }
+        var apps = fader.exemptApps
+        if apps.remove(bid) == nil { apps.insert(bid) }
+        fader.exemptApps = apps
+    }
+
+    @objc func unlockWindow(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? Int else { return }
+        fader.toggleLock(CGWindowID(id))
+    }
+}
+
 /// 构建脚本用：把 App 图标渲染成 PNG
 @MainActor func renderIcon(to path: String) {
     let view = ZStack {
@@ -166,6 +225,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
     MainActor.assumeIsolated { renderIcon(to: CommandLine.arguments[i + 1]) }
+    exit(0)
+}
+
+/// 排查用：列出被认定为“正在播放视频”的 App
+if CommandLine.arguments.contains("--list-video") {
+    for pid in VideoWatch.playingPids().sorted() {
+        let app = NSRunningApplication(processIdentifier: pid)
+        print(pid, app?.localizedName ?? "-", app?.bundleIdentifier ?? "-")
+    }
     exit(0)
 }
 

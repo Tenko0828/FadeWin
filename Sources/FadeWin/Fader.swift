@@ -6,6 +6,7 @@ struct WinInfo {
     let owner: String
     let title: String
     let bounds: CGRect   // CG 坐标：原点在主屏左上角
+    var layer: Int = 0   // 0 普通窗口；3 浮动面板（很多 App 的设置窗口）；8 模态面板
 }
 
 enum FadeSpeed: String, CaseIterable {
@@ -110,6 +111,8 @@ final class Fader {
     private var targets: [CGWindowID: CGFloat] = [:]
     private var shown: [CGWindowID: CGFloat] = [:]
     private var animTimer: Timer?
+    private let frameTicker = FrameTicker()
+    private var displayLink: AnyObject?
     private var lastAnim = Date()
 
     /// 窗口在动（拖动、显示桌面时一起滑开）时雾层先藏起来，停稳了再淡回来；vis 就是这个“显现度”
@@ -131,9 +134,17 @@ final class Fader {
         let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
-        let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
-        RunLoop.main.add(a, forMode: .common)
-        animTimer = a
+        // 动画跟着屏幕刷新走（120 Hz 屏上就是 120 帧）；macOS 13 没有这个接口，退回 60 Hz 计时器
+        if #available(macOS 14, *), let screen = NSScreen.main {
+            let link = screen.displayLink(target: frameTicker, selector: #selector(FrameTicker.tick))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+            frameTicker.onTick = { [weak self] in self?.animate() }
+        } else {
+            let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
+            RunLoop.main.add(a, forMode: .common)
+            animTimer = a
+        }
 
         // 点下去的那一刻就把雾层提到最上面，赶在窗口被系统提到前台之前；
         // 否则窗口会先盖住雾层（一下变清晰），下一次轮询雾层又盖回来（一下变模糊），就是闪
@@ -153,13 +164,14 @@ final class Fader {
               let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
         lastFocus[w.id] = Date()
         targets[w.id] = 0
-        raise(win)
+        raise(win, above: w.layer)
     }
 
-    /// 正在恢复的雾层放到普通窗口之上：它盖着的窗口这时本来就在最前面，所以看起来没区别，但不会被窗口抢到上面
-    private func raise(_ win: NSWindow) {
-        guard win.level != .floating else { return }
-        win.level = .floating
+    /// 正在恢复的雾层放到目标窗口所在层级之上：它盖着的窗口这时本来就在最前面，所以看起来没区别，但不会被窗口抢到上面
+    private func raise(_ win: NSWindow, above layer: Int) {
+        let up = NSWindow.Level(rawValue: layer + 1)
+        guard win.level != up else { return }
+        win.level = up
         win.orderFront(nil)
     }
 
@@ -175,6 +187,10 @@ final class Fader {
     }
 
     private var bundleIDs: [pid_t: String] = [:]
+
+    /// 正在播放视频的 App（每秒查一次）；它们的窗口不褪色，免得看视频时画面被盖住
+    private(set) var videoPids: Set<pid_t> = []
+    private var videoChecked = Date.distantPast
 
     func bundleID(of pid: pid_t) -> String? {
         if let b = bundleIDs[pid] { return b }
@@ -210,9 +226,10 @@ final class Fader {
         for id in lastFocus.keys { lastFocus[id] = now }
     }
 
-    /// 锁定的窗口、例外 App 的窗口都不褪色
+    /// 锁定的窗口、例外 App 的窗口、正在放视频的 App 的窗口都不褪色
     private func isExempt(_ w: WinInfo) -> Bool {
         if lockedWindows.contains(w.id) { return true }
+        if videoPids.contains(w.pid) { return true }
         if let b = bundleID(of: w.pid), exemptApps.contains(b) { return true }
         return false
     }
@@ -222,6 +239,10 @@ final class Fader {
     }
 
     // MARK: - 窗口列表
+
+    /// 处理哪些层级的窗口：普通窗口，加上浮动面板和模态面板（有些 App 的设置窗口就是浮动面板）。
+    /// 输入法候选框、Dock、菜单栏都在更高的层级，不会被算进来
+    static let fadeLayers: Set<Int> = [0, 3, 8]
 
     /// 返回要处理的普通窗口、屏幕上所有窗口（含 Dock、菜单栏、我们自己的雾层）从前到后的顺序，
     /// 以及调度中心（三指上滑）是否正开着
@@ -245,7 +266,8 @@ final class Fader {
                 (name == nil && (w[kCGWindowOwnerName as String] as? String) == "WindowManager" && (w[kCGWindowLayer as String] as? Int) == 19) {
                 mc = true
             }
-            guard (w[kCGWindowLayer as String] as? Int) == 0,
+            let layer = w[kCGWindowLayer as String] as? Int ?? -1
+            guard Self.fadeLayers.contains(layer),
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != me,
                   let bd = w[kCGWindowBounds as String] as? NSDictionary,
@@ -253,7 +275,7 @@ final class Fader {
                   b.width >= 120, b.height >= 80 else { continue }
             let owner = w[kCGWindowOwnerName as String] as? String ?? ""
             if owner == "Window Server" || owner == "Dock" { continue }
-            out.append(WinInfo(id: id, pid: pid, owner: owner, title: w[kCGWindowName as String] as? String ?? "", bounds: b))
+            out.append(WinInfo(id: id, pid: pid, owner: owner, title: w[kCGWindowName as String] as? String ?? "", bounds: b, layer: layer))
         }
         return (out, order, frames, mc)
     }
@@ -284,10 +306,18 @@ final class Fader {
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
         // 只有真正排在最前面、又属于前台 App 的窗口才算“正在用”。
-        // 点桌面时访达会变成前台 App，但它的窗口可能压在别的窗口后面，不能算
-        let focusedID: CGWindowID? = wins.first.flatMap { $0.pid == frontPid ? $0.id : nil }
+        // 点桌面时访达会变成前台 App，但它的窗口可能压在别的窗口后面，不能算。
+        // 普通窗口和面板分开看：别的 App 的常驻浮窗挡在最前面，不影响普通窗口里谁是“正在用”；
+        // 前台 App 自己的面板（比如设置窗口）在最前面时，它也算正在用
+        let focusedID: CGWindowID? = wins.first(where: { $0.layer == 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
+        let focusedPanel: CGWindowID? = wins.first(where: { $0.layer != 0 }).flatMap { $0.pid == frontPid ? $0.id : nil }
         if let focusedID { lastFocus[focusedID] = now }
+        if let focusedPanel { lastFocus[focusedPanel] = now }
         let alive = Set(wins.map(\.id))
+        if now.timeIntervalSince(videoChecked) > 1 {
+            videoPids = VideoWatch.playingPids()
+            videoChecked = now
+        }
         for w in wins where lastFocus[w.id] == nil || isExempt(w) { lastFocus[w.id] = now }
         // 不在屏幕上的窗口（切到别的桌面空间、最小化）保留计时，回来时接着褪；每 10 秒清一次已经关掉的
         pollCount += 1
@@ -357,10 +387,11 @@ final class Fader {
             let moving = now.timeIntervalSince(lastMoved[w.id] ?? .distantPast) < Self.settleDelay
             settled[w.id] = !moving
             captureBounds[w.id] = b
-            if w.id == focusedID, target <= 0.002 {
-                raise(win)
+            let level = NSWindow.Level(rawValue: w.layer)
+            if w.id == focusedID || w.id == focusedPanel, target <= 0.002 {
+                raise(win, above: w.layer)
             } else {
-                if win.level != .normal { win.level = .normal }
+                if win.level != level { win.level = level }
                 // 只在雾层不在窗口正上方时才调整层级，少折腾窗口服务器
                 let oi = order.firstIndex(of: CGWindowID(win.windowNumber)), wi = order.firstIndex(of: w.id)
                 if oi == nil || wi == nil || oi! + 1 != wi! { win.order(.above, relativeTo: Int(w.id)) }
@@ -373,7 +404,7 @@ final class Fader {
                 if b.minY <= w.bounds.minY + 0.5 { edges.insert(.top) }
                 if b.maxY >= w.bounds.maxY - 0.5 { edges.insert(.bottom) }
                 v.edges = edges
-                let clipped = WinInfo(id: w.id, pid: w.pid, owner: w.owner, title: w.title, bounds: b)
+                let clipped = WinInfo(id: w.id, pid: w.pid, owner: w.owner, title: w.title, bounds: b, layer: w.layer)
                 seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving, edges)
             }
         }
@@ -495,4 +526,10 @@ final class Fader {
         overlays.removeAll()
         shown.removeAll()
     }
+}
+
+/// 屏幕刷新回调需要一个 Objective-C 对象当目标，Fader 不是，所以转一手
+final class FrameTicker: NSObject {
+    var onTick: (() -> Void)?
+    @objc func tick() { onTick?() }
 }
