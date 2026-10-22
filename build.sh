@@ -22,7 +22,8 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
-codesign --force --sign - "$APP" >/dev/null
+# 用固定的签名要求，重新编译后「屏幕录制」授权不会失效
+codesign --force --sign - -r='designated => identifier "local.tenko.fadewin"' "$APP" >/dev/null
 echo "✓ 已生成 $APP"
 
 # ./build.sh install：装进「应用程序」并设为开机启动

@@ -30,13 +30,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speedItem.submenu = sub
         menu.addItem(speedItem)
 
-        if FadeStyle.glassAvailable {
+        do {
             let styleItem = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
             let sm = NSMenu()
-            for st in FadeStyle.allCases {
+            for st in FadeStyle.allCases where st != .glass || FadeStyle.glassAvailable {
                 let mi = item(st.title, #selector(pickStyle(_:)), on: fader.style == st)
                 mi.representedObject = st.rawValue
                 sm.addItem(mi)
+            }
+            if fader.style == .seeThrough, !SeeThrough.hasPermission {
+                sm.addItem(.separator())
+                sm.addItem(item("还没授权屏幕录制，现在用玻璃顶着 · 去授权…", #selector(openScreenCaptureSettings)))
             }
             styleItem.submenu = sm
             menu.addItem(styleItem)
@@ -82,7 +86,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pickStyle(_ sender: NSMenuItem) {
-        if let raw = sender.representedObject as? String, let st = FadeStyle(rawValue: raw) { fader.style = st }
+        guard let raw = sender.representedObject as? String, let st = FadeStyle(rawValue: raw) else { return }
+        fader.style = st
+        if st == .seeThrough, !SeeThrough.hasPermission { openScreenCaptureSettings() }
+    }
+
+    @objc private func openScreenCaptureSettings() {
+        _ = CGRequestScreenCaptureAccess()   // 让系统把 FadeWin 加进“屏幕录制”列表
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
 
     @objc private func bringBack(_ sender: NSMenuItem) {

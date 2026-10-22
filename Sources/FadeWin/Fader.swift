@@ -32,10 +32,11 @@ enum FadeSpeed: String, CaseIterable {
 }
 
 enum FadeStyle: String, CaseIterable {
-    case glass, veil
+    case seeThrough, glass, veil
 
     var title: String {
         switch self {
+        case .seeThrough: "透视（越久越透明，能看到窗口后面；需屏幕录制权限）"
         case .glass: "液态玻璃（越久越磨砂，内容逐渐虚化）"
         case .veil: "纯色薄雾"
         }
@@ -67,13 +68,23 @@ final class Fader {
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "speed") }
     }
 
+    /// 用户选的外观
     var style: FadeStyle {
         get {
             let saved = FadeStyle(rawValue: UserDefaults.standard.string(forKey: "style") ?? "") ?? .glass
             return saved == .glass && !FadeStyle.glassAvailable ? .veil : saved
         }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: "style"); clearOverlays() }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "style") }
     }
+
+    /// 实际生效的外观：选了透视但还没授权屏幕录制时，先用玻璃（或薄雾）顶着
+    var effectiveStyle: FadeStyle {
+        if style == .seeThrough, !SeeThrough.hasPermission { return FadeStyle.glassAvailable ? .glass : .veil }
+        return style
+    }
+
+    private var overlayStyle: FadeStyle?
+    private lazy var seeThrough: SeeThrough = MainActor.assumeIsolated { SeeThrough() }
 
     func start() {
         let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -125,10 +136,24 @@ final class Fader {
             overlays[id] = nil
         }
 
+        let current = effectiveStyle
+        if overlayStyle != current {
+            clearOverlays()
+            overlayStyle = current
+        }
+        var seeTargets: [CGWindowID: (win: WinInfo, view: NSView)] = [:]
+
         let (grace, full) = speed.span
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let veil = dark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.94, alpha: 1)
         let screenH = NSScreen.screens.first?.frame.height ?? 0
+
+        defer {
+            if current == .seeThrough {
+                let ids = Set(overlays.values.map { CGWindowID($0.windowNumber) })
+                MainActor.assumeIsolated { seeThrough.sync(targets: seeTargets, overlayIDs: ids) }
+            }
+        }
 
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
@@ -142,7 +167,22 @@ final class Fader {
             let win = overlays[w.id] ?? makeOverlay()
             overlays[w.id] = win
             win.setFrame(frame, display: false)
-            apply(amount: alpha / Self.maxAlpha, veil: veil, to: win)
+            if current == .seeThrough, let v = win.contentView {
+                seeTargets[w.id] = (w, v)
+                let live = MainActor.assumeIsolated { seeThrough.isLive(w.id) }
+                let amount = alpha / Self.maxAlpha
+                if live {
+                    // 抓到了“窗口后面”的画面：雾层按比例变淡，窗口就像变透明了（留一点影子，免得彻底找不到）
+                    v.layer?.backgroundColor = nil
+                    win.alphaValue = 0.93 * amount
+                } else {
+                    // 还没抓到画面（刚开始、或超出同时抓取上限）：先用薄雾顶着
+                    win.alphaValue = 1
+                    v.layer?.backgroundColor = veil.withAlphaComponent(alpha).cgColor
+                }
+            } else {
+                apply(amount: alpha / Self.maxAlpha, veil: veil, to: win)
+            }
             win.order(.above, relativeTo: Int(w.id))
         }
     }
@@ -166,7 +206,7 @@ final class Fader {
         win.ignoresMouseEvents = true
         win.isReleasedWhenClosed = false
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
-        if #available(macOS 26, *), style == .glass {
+        if #available(macOS 26, *), effectiveStyle == .glass {
             let glass = NSGlassEffectView()
             glass.style = .regular
             glass.cornerRadius = 20
@@ -175,12 +215,15 @@ final class Fader {
             let v = NSView()
             v.wantsLayer = true
             v.layer?.cornerRadius = 10
+            v.layer?.masksToBounds = true
+            v.layer?.contentsGravity = .resize
             win.contentView = v
         }
         return win
     }
 
     private func clearOverlays() {
+        MainActor.assumeIsolated { seeThrough.stopAll() }
         overlays.values.forEach { $0.orderOut(nil) }
         overlays.removeAll()
     }
