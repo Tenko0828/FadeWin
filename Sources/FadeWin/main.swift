@@ -44,6 +44,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             styleItem.submenu = sm
             menu.addItem(styleItem)
+            if fader.style == .seeThrough {
+                menu.addItem(item("透视时加隐私薄雾（看不清窗口上的字）", #selector(togglePrivacy), on: fader.privacyFrost))
+            }
         }
 
         // 被遗忘最久的窗口，点一下把它的 App 叫回前台
@@ -90,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fader.style = st
         if st == .seeThrough, !SeeThrough.hasPermission { openScreenCaptureSettings() }
     }
+
+    @objc private func togglePrivacy() { fader.privacyFrost.toggle() }
 
     @objc private func openScreenCaptureSettings() {
         _ = CGRequestScreenCaptureAccess()   // 让系统把 FadeWin 加进“屏幕录制”列表

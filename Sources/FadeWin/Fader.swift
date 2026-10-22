@@ -60,12 +60,21 @@ final class Fader {
 
     var paused: Bool {
         get { UserDefaults.standard.bool(forKey: "paused") }
-        set { UserDefaults.standard.set(newValue, forKey: "paused"); if newValue { clearOverlays() } }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "paused")
+            if newValue { clearOverlays() } else { lastFocus.removeAll() }   // 暂停期间不算闲置
+        }
     }
 
     var speed: FadeSpeed {
         get { FadeSpeed(rawValue: UserDefaults.standard.string(forKey: "speed") ?? "") ?? .normal }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "speed") }
+    }
+
+    /// 透视时给窗口自己的内容加一层磨砂，别人看不清上面的字（默认开）
+    var privacyFrost: Bool {
+        get { !UserDefaults.standard.bool(forKey: "noPrivacyFrost") }
+        set { UserDefaults.standard.set(!newValue, forKey: "noPrivacyFrost") }
     }
 
     /// 用户选的外观
@@ -79,8 +88,19 @@ final class Fader {
 
     /// 实际生效的外观：选了透视但还没授权屏幕录制时，先用玻璃（或薄雾）顶着
     var effectiveStyle: FadeStyle {
-        if style == .seeThrough, !SeeThrough.hasPermission { return FadeStyle.glassAvailable ? .glass : .veil }
+        if style == .seeThrough, !permissionCached { return FadeStyle.glassAvailable ? .glass : .veil }
         return style
+    }
+
+    /// 屏幕录制权限每 3 秒查一次就够了，不必每次轮询都问系统
+    private var permissionChecked = Date.distantPast
+    private var permissionValue = false
+    private var permissionCached: Bool {
+        if Date().timeIntervalSince(permissionChecked) > 3 {
+            permissionValue = SeeThrough.hasPermission
+            permissionChecked = Date()
+        }
+        return permissionValue
     }
 
     private var overlayStyle: FadeStyle?
@@ -97,6 +117,10 @@ final class Fader {
     private var vis: [CGWindowID: CGFloat] = [:]
     private var settled: [CGWindowID: Bool] = [:]
     private var captureBounds: [CGWindowID: CGRect] = [:]
+    private var inMissionControl = false
+    /// 屏幕上所有窗口（任何层级）从前到后的位置，用来判断鼠标真正点中的是谁
+    private var allFrames: [(id: CGWindowID, bounds: CGRect)] = []
+    private var pollCount = 0
     static let settleDelay: TimeInterval = 0.35
 
     /// 透视时窗口最多透明到这里，保留一点影子，免得彻底看不见
@@ -122,7 +146,11 @@ final class Fader {
         let p = NSEvent.mouseLocation
         let h = NSScreen.screens.first?.frame.height ?? 0
         let pt = CGPoint(x: p.x, y: h - p.y)
-        guard let w = snapshot.first(where: { $0.bounds.contains(pt) }), let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
+        // 按真实层级找最上面那个被点中的窗口（跳过我们自己的雾层）；点中的是 Dock、浮动面板之类就不算
+        let mine = Set(overlays.values.map { CGWindowID($0.windowNumber) })
+        guard let hit = allFrames.first(where: { !mine.contains($0.id) && $0.bounds.contains(pt) }),
+              let w = snapshot.first(where: { $0.id == hit.id }),
+              let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
         lastFocus[w.id] = Date()
         targets[w.id] = 0
         raise(win)
@@ -141,15 +169,28 @@ final class Fader {
 
     // MARK: - 窗口列表
 
-    /// 返回要处理的普通窗口，以及屏幕上所有窗口（含 Dock、菜单栏、我们自己的雾层）从前到后的顺序
-    static func onScreenWindows() -> (wins: [WinInfo], order: [CGWindowID]) {
+    /// 返回要处理的普通窗口、屏幕上所有窗口（含 Dock、菜单栏、我们自己的雾层）从前到后的顺序，
+    /// 以及调度中心（三指上滑）是否正开着
+    static func onScreenWindows() -> (wins: [WinInfo], order: [CGWindowID], frames: [(id: CGWindowID, bounds: CGRect)], missionControl: Bool) {
         let me = ProcessInfo.processInfo.processIdentifier
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return ([], []) }
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return ([], [], [], false) }
         var out: [WinInfo] = []
         var order: [CGWindowID] = []
+        var frames: [(id: CGWindowID, bounds: CGRect)] = []
+        var mc = false
         for w in list {
             guard let id = w[kCGWindowNumber as String] as? CGWindowID else { continue }
             order.append(id)
+            if let bd = w[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd as CFDictionary),
+               (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05 {
+                frames.append((id, b))
+            }
+            // 调度中心开着时系统会铺一层 ExposeShieldWindow；没有屏幕录制权限读不到窗口名，就按所属进程和层级认
+            let name = w[kCGWindowName as String] as? String
+            if name == "ExposeShieldWindow" ||
+                (name == nil && (w[kCGWindowOwnerName as String] as? String) == "WindowManager" && (w[kCGWindowLayer as String] as? Int) == 19) {
+                mc = true
+            }
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != me,
@@ -160,23 +201,46 @@ final class Fader {
             if owner == "Window Server" || owner == "Dock" { continue }
             out.append(WinInfo(id: id, pid: pid, owner: owner, title: w[kCGWindowName as String] as? String ?? "", bounds: b))
         }
-        return (out, order)
+        return (out, order, frames, mc)
     }
 
     // MARK: - 每 0.1 秒：算目标、跟随窗口位置
 
     private func poll() {
         guard !paused else { return }
-        let (wins, order) = Self.onScreenWindows()
-        snapshot = wins
+        let (wins, order, frames, missionControl) = Self.onScreenWindows()
         let now = Date()
+
+        // 调度中心开着时窗口被系统缩放成缩略图，位置数据却不变，雾层没法跟：全部藏起来，什么都不动。
+        // 退出后窗口还要飞回原位，多等一会儿，并且等抓取画面换成新的再淡回来
+        if missionControl {
+            if !inMissionControl {
+                inMissionControl = true
+                for (id, win) in overlays { vis[id] = 0; win.alphaValue = 0 }
+            }
+            return
+        }
+        if inMissionControl {
+            inMissionControl = false
+            for id in overlays.keys { lastMoved[id] = now.addingTimeInterval(0.35) }
+            MainActor.assumeIsolated { seeThrough.awaitFreshFrames() }
+        }
+        snapshot = wins
+        allFrames = frames
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
 
-        // 前台 App 最上面的那个窗口算“正在用”
-        if let focused = wins.first(where: { $0.pid == frontPid }) { lastFocus[focused.id] = now }
+        // 只有真正排在最前面、又属于前台 App 的窗口才算“正在用”。
+        // 点桌面时访达会变成前台 App，但它的窗口可能压在别的窗口后面，不能算
+        let focusedID: CGWindowID? = wins.first.flatMap { $0.pid == frontPid ? $0.id : nil }
+        if let focusedID { lastFocus[focusedID] = now }
         let alive = Set(wins.map(\.id))
         for w in wins where lastFocus[w.id] == nil { lastFocus[w.id] = now }
-        lastFocus = lastFocus.filter { alive.contains($0.key) }
+        // 不在屏幕上的窗口（切到别的桌面空间、最小化）保留计时，回来时接着褪；每 10 秒清一次已经关掉的
+        pollCount += 1
+        if pollCount % 300 == 0, let all = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
+            let exists = Set(all.compactMap { $0[kCGWindowNumber as String] as? CGWindowID })
+            lastFocus = lastFocus.filter { exists.contains($0.key) }
+        }
         for (id, win) in overlays where !alive.contains(id) {
             win.orderOut(nil)
             overlays[id] = nil
@@ -196,8 +260,7 @@ final class Fader {
         let screenH = NSScreen.screens.first?.frame.height ?? 0
         // 各屏幕在 CG 坐标（左上角原点）里的范围，透视时只处理窗口在屏幕内的部分
         let screensCG = NSScreen.screens.map { CGRect(x: $0.frame.minX, y: screenH - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height) }
-        var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool)] = [:]
-        let focusedID = wins.first(where: { $0.pid == frontPid })?.id
+        var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges)] = [:]
 
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
@@ -247,8 +310,15 @@ final class Fader {
                 if oi == nil || wi == nil || oi! + 1 != wi! { win.order(.above, relativeTo: Int(w.id)) }
             }
             if current == .seeThrough, let v = win.contentView as? SeeView {
+                // 被屏幕边缘截掉的边不是真边：那里不画圆角也不画玻璃边框（CG 坐标里 minY 是上边）
+                var edges: Edges = []
+                if b.minX <= w.bounds.minX + 0.5 { edges.insert(.left) }
+                if b.maxX >= w.bounds.maxX - 0.5 { edges.insert(.right) }
+                if b.minY <= w.bounds.minY + 0.5 { edges.insert(.top) }
+                if b.maxY >= w.bounds.maxY - 0.5 { edges.insert(.bottom) }
+                v.edges = edges
                 let clipped = WinInfo(id: w.id, pid: w.pid, owner: w.owner, title: w.title, bounds: b)
-                seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving)
+                seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving, edges)
             }
         }
 
@@ -286,7 +356,7 @@ final class Fader {
             }
 
             // 停稳之后再淡回来；透视还要等抓取画面对上新位置，不然会先闪一下旧画面
-            var ready = settled[id] ?? true
+            var ready = !inMissionControl && (settled[id] ?? true)
             if ready, current == .seeThrough, let b = captureBounds[id] {
                 ready = MainActor.assumeIsolated { seeThrough.isReady(id, bounds: b) }
             }
@@ -312,12 +382,14 @@ final class Fader {
                 // 边缘：玻璃边框比中间更早、更实地出现，褪尽之后窗口轮廓依然清楚
                 win.alphaValue = 1
                 v.layer?.backgroundColor = nil
+                v.frost.alphaValue = privacyFrost ? min(1, amount * 1.3) : 0
                 v.base.opacity = Float(Self.maxSeeThrough * amount)
                 v.rim.opacity = Float(min(1, amount * 1.6))
             } else {
                 // 还没抓到画面（刚开始，或超过同时抓取上限）：先用薄雾顶着
                 win.alphaValue = Self.maxAlpha * amount
                 v.layer?.backgroundColor = veil.cgColor
+                v.frost.alphaValue = 0
                 v.base.opacity = 0
                 v.rim.opacity = 0
             }
