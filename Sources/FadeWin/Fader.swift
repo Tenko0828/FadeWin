@@ -9,22 +9,24 @@ struct WinInfo {
 }
 
 enum FadeSpeed: String, CaseIterable {
-    case fast, normal, slow
+    case demo, fast, normal, slow
 
     var title: String {
         switch self {
-        case .fast: "快（30 秒后开始，5 分钟褪尽）"
-        case .normal: "中（2 分钟后开始，20 分钟褪尽）"
-        case .slow: "慢（10 分钟后开始，2 小时褪尽）"
+        case .demo: "演示（3 秒后开始，12 秒褪尽）"
+        case .fast: "快（15 秒后开始，90 秒褪尽）"
+        case .normal: "中（1 分钟后开始，10 分钟褪尽）"
+        case .slow: "慢（5 分钟后开始，1 小时褪尽）"
         }
     }
 
     /// (开始褪色前的宽限, 褪到最浅所需的总时间)，单位秒
     var span: (grace: Double, full: Double) {
         switch self {
-        case .fast: (30, 300)
-        case .normal: (120, 1200)
-        case .slow: (600, 7200)
+        case .demo: (3, 12)
+        case .fast: (15, 90)
+        case .normal: (60, 600)
+        case .slow: (300, 3600)
         }
     }
 }
@@ -98,7 +100,7 @@ final class Fader {
             overlays[id] = nil
         }
 
-        let (grace, full) = ProcessInfo.processInfo.environment["FADEWIN_DEMO"] != nil ? (3.0, 12.0) : speed.span
+        let (grace, full) = speed.span
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let veil = dark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.94, alpha: 1)
         let screenH = NSScreen.screens.first?.frame.height ?? 0
@@ -106,7 +108,7 @@ final class Fader {
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
             let t = min(max((idle - grace) / (full - grace), 0), 1)
-            let alpha = Self.maxAlpha * CGFloat(t * t * (3 - 2 * t))   // smoothstep，起止都柔和
+            let alpha = Self.maxAlpha * CGFloat(1 - (1 - t) * (1 - t))   // 先快后慢：刚开始褪就能看出来
             guard alpha > 0.01 else {
                 if let o = overlays[w.id] { o.orderOut(nil); overlays[w.id] = nil }
                 continue
