@@ -15,9 +15,9 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     private var rimIndex = 0
     /// 画布上画的是哪几条边；变了就得换新画布，不然被截掉那一侧会留下旧边框
     private var poolEdges: Edges = .all
-    /// 边框每秒最多重画 10 次：边框里只是被折射的背景，晚一点看不出来，但每次重画都很费 CPU
+    /// 边框每秒最多重画 5 次：边框里只是被折射的背景，晚一点看不出来，但每次重画都很费 CPU
     private var lastRim: CFTimeInterval = 0
-    private static let rimInterval: CFTimeInterval = 0.1
+    private static let rimInterval: CFTimeInterval = 0.2
     private(set) var live = false
     // 抓取线程只需要这两个值；一起取快照，避免画边框时和主线程争读写
     private struct CaptureGeometry {
@@ -133,12 +133,14 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 每次轮询调一次：targets 是正在褪色的窗口和它们的雾层视图，order 是屏幕上所有窗口从前到后的顺序。
     /// 一个窗口的“后面”= 屏幕去掉它自己以及所有在它前面的窗口（含 Dock、菜单栏、前面窗口的雾层）。
     /// 这样后面窗口的雾层里不会混进前面窗口的旧画面，叠在一起的窗口各褪各的
-    func sync(targets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges)], order: [CGWindowID]) {
+    func sync(targets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges, covered: Bool)], order: [CGWindowID]) {
         // 按前后顺序排名：新打开、排在前面的窗口可以从最后面的窗口那里接过名额
         let rank: [CGWindowID: Int] = Dictionary(uniqueKeysWithValues: targets.keys
             .sorted { (order.firstIndex(of: $0) ?? .max) < (order.firstIndex(of: $1) ?? .max) }
             .enumerated().map { ($1, $0) })
-        for id in replicas.keys where targets[id] == nil || (rank[id] ?? .max) >= Self.keepRank && targets[id]?.frozen != true {
+        // 被前面窗口完全挡住的窗口看不见，也停掉抓取
+        for id in replicas.keys where targets[id] == nil
+            || ((rank[id] ?? .max) >= Self.keepRank || targets[id]?.covered == true) && targets[id]?.frozen != true {
             if let r = replicas.removeValue(forKey: id) { Task { try? await r.stream.stopCapture() } }
         }
         guard !targets.isEmpty else { return }
@@ -163,7 +165,7 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
                 if r.bounds != t.win.bounds || r.excluded != wanted {
                     update(r, bounds: t.win.bounds, excluding: wanted, content: content)
                 }
-            } else if !t.frozen, !starting.contains(id), (rank[id] ?? .max) < Self.maxReplicas,
+            } else if !t.frozen, !t.covered, !starting.contains(id), (rank[id] ?? .max) < Self.maxReplicas,
                       replicas.count + starting.count < Self.keepRank {
                 start(id: id, win: t.win, view: t.view, excluding: wanted, edges: t.edges, content: content)
             }

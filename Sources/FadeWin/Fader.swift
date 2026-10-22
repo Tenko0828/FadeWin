@@ -122,7 +122,7 @@ final class Fader {
     private var captureBounds: [CGWindowID: CGRect] = [:]
     private var inMissionControl = false
     /// 屏幕上所有窗口（任何层级）从前到后的位置，用来判断鼠标真正点中的是谁
-    private var allFrames: [(id: CGWindowID, bounds: CGRect)] = []
+    private var allFrames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)] = []
     private var pollCount = 0
     static let settleDelay: TimeInterval = 0.35
 
@@ -130,7 +130,7 @@ final class Fader {
     static let maxSeeThrough: CGFloat = 0.72
 
     func start() {
-        // 窗口列表 20 次/秒，好尽早发现窗口在动（没有雾层时 poll 里再降到 4 次/秒）
+        // 每秒 20 次检查（大多只取窗口编号，很便宜），好尽早发现窗口在动；没有雾层时 poll 里再降到 4 次/秒
         let t = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -154,12 +154,16 @@ final class Fader {
     }
 
     private func mouseDown() {
+        boostUntil = Date().addingTimeInterval(1.5)
         let p = NSEvent.mouseLocation
         let h = NSScreen.screens.first?.frame.height ?? 0
         let pt = CGPoint(x: p.x, y: h - p.y)
-        // 按真实层级找最上面那个被点中的窗口（跳过我们自己的雾层）；点中的是 Dock、浮动面板之类就不算
+        // 点在 Dock 或菜单栏那一条里就不算（屏幕“可用区域”之外）
+        guard NSScreen.screens.contains(where: { $0.visibleFrame.contains(p) }) else { return }
+        // 按真实层级找最上面那个被点中的普通窗口或面板（跳过我们自己的雾层）。
+        // 不能用所有窗口：Dock 是一张盖满全屏的透明窗口，排在最前面，会把所有点击都“接走”
         let mine = Set(overlays.values.map { CGWindowID($0.windowNumber) })
-        guard let hit = allFrames.first(where: { !mine.contains($0.id) && $0.bounds.contains(pt) }),
+        guard let hit = allFrames.first(where: { $0.opaque && !mine.contains($0.id) && $0.bounds.contains(pt) }),
               let w = snapshot.first(where: { $0.id == hit.id }),
               let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
         lastFocus[w.id] = Date()
@@ -190,6 +194,9 @@ final class Fader {
 
     /// 正在播放视频的 App（每秒查一次）；它们的窗口不褪色，免得看视频时画面被盖住
     private(set) var videoPids: Set<pid_t> = []
+    /// 画面在持续变化的窗口（静音视频、播放器里的画面），同样不褪色
+    private(set) var movingWindows: Set<CGWindowID> = []
+    private lazy var motion: MotionWatch = MainActor.assumeIsolated { MotionWatch() }
     private var videoChecked = Date.distantPast
 
     func bundleID(of pid: pid_t) -> String? {
@@ -229,7 +236,7 @@ final class Fader {
     /// 锁定的窗口、例外 App 的窗口、正在放视频的 App 的窗口都不褪色
     private func isExempt(_ w: WinInfo) -> Bool {
         if lockedWindows.contains(w.id) { return true }
-        if videoPids.contains(w.pid) { return true }
+        if videoPids.contains(w.pid) || movingWindows.contains(w.id) { return true }
         if let b = bundleID(of: w.pid), exemptApps.contains(b) { return true }
         return false
     }
@@ -246,19 +253,23 @@ final class Fader {
 
     /// 返回要处理的普通窗口、屏幕上所有窗口（含 Dock、菜单栏、我们自己的雾层）从前到后的顺序，
     /// 以及调度中心（三指上滑）是否正开着
-    static func onScreenWindows() -> (wins: [WinInfo], order: [CGWindowID], frames: [(id: CGWindowID, bounds: CGRect)], missionControl: Bool) {
+    static func onScreenWindows() -> (wins: [WinInfo], order: [CGWindowID], frames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)], missionControl: Bool) {
         let me = ProcessInfo.processInfo.processIdentifier
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return ([], [], [], false) }
         var out: [WinInfo] = []
         var order: [CGWindowID] = []
-        var frames: [(id: CGWindowID, bounds: CGRect)] = []
+        var frames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)] = []
         var mc = false
         for w in list {
             guard let id = w[kCGWindowNumber as String] as? CGWindowID else { continue }
             order.append(id)
             if let bd = w[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: bd as CFDictionary),
                (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.05 {
-                frames.append((id, b))
+                // 能“挡住”别的窗口的只有普通窗口和面板，而且得基本不透明。
+                // Dock 在系统里是一张盖满全屏的透明窗口，菜单栏、各种系统层也一样，它们都不算
+                let layer = w[kCGWindowLayer as String] as? Int ?? -1
+                let opaque = Self.fadeLayers.contains(layer) && (w[kCGWindowAlpha as String] as? Double ?? 1) > 0.95
+                frames.append((id, b, opaque))
             }
             // 调度中心开着时系统会铺一层 ExposeShieldWindow；没有屏幕录制权限读不到窗口名，就按所属进程和层级认
             let name = w[kCGWindowName as String] as? String
@@ -280,9 +291,25 @@ final class Fader {
         return (out, order, frames, mc)
     }
 
-    // MARK: - 每 0.1 秒：算目标、跟随窗口位置
+    private typealias ListCreate = @convention(c) (CGWindowListOption, CGWindowID) -> Unmanaged<CFArray>?
+    /// 只取窗口编号的查询，比完整查询便宜得多。Swift 里被标成不可用，通过函数指针调用；
+    /// 返回的数组里直接装着编号数值（不是 NSNumber）
+    private static let listCreate: ListCreate? = dlsym(dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW),
+                                                       "CGWindowListCreate").map { unsafeBitCast($0, to: ListCreate.self) }
+
+    static func windowIDs() -> [CGWindowID]? {
+        guard let f = listCreate, let arr = f([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)?.takeRetainedValue() else { return nil }
+        return (0..<CFArrayGetCount(arr)).map { CGWindowID(UInt(bitPattern: CFArrayGetValueAtIndex(arr, $0))) }
+    }
+
+    // MARK: - 每 0.05 秒：算目标、跟随窗口位置
 
     private var lastPoll = Date.distantPast
+    /// 上一次完整查询的结果；窗口编号和顺序没变、又不到下一次完整查询时就直接复用
+    private var cachedList: (wins: [WinInfo], order: [CGWindowID], frames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)], missionControl: Bool)?
+    private var lastFull = Date.distantPast
+    /// 鼠标按下后的一小段时间里窗口很可能在动（拖动、点桌面让窗口散开），这段时间每次都完整查询
+    private var boostUntil = Date.distantPast
 
     private func poll() {
         guard !paused else { return }
@@ -290,7 +317,19 @@ final class Fader {
         let started = Date()
         if overlays.isEmpty, started.timeIntervalSince(lastPoll) < 0.25 { return }
         lastPoll = started
-        let (wins, order, frames, missionControl) = Self.onScreenWindows()
+        // 先只取编号：窗口有增减、换了顺序（含调度中心出现）都会反映在这里，便宜又及时；
+        // 编号没变时，完整查询（为了跟上窗口位置）平时每秒 10 次，鼠标按下后的 1.5 秒内每次都查
+        let ids = Self.windowIDs()
+        let fullInterval: TimeInterval = started < boostUntil ? 0 : 0.1
+        let list: (wins: [WinInfo], order: [CGWindowID], frames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)], missionControl: Bool)
+        if let cached = cachedList, let ids, ids == cached.order, started.timeIntervalSince(lastFull) < fullInterval {
+            list = cached
+        } else {
+            list = Self.onScreenWindows()
+            cachedList = list
+            lastFull = started
+        }
+        let (wins, order, frames, missionControl) = list
         let now = Date()
 
         // 调度中心开着时窗口被系统缩放成缩略图，位置数据却不变，雾层没法跟：全部藏起来，什么都不动。
@@ -324,6 +363,17 @@ final class Fader {
             videoPids = VideoWatch.playingPids()
             videoChecked = now
         }
+        // 盯着不是“正在用”的窗口看画面在不在动（前面的优先）；需要屏幕录制权限
+        if permissionCached {
+            let watch = wins.filter { $0.id != focusedID && !lockedWindows.contains($0.id) && !videoPids.contains($0.pid)
+                && !Self.isFullyCovered($0.bounds, by: frames, before: $0.id, ignoring: Set(overlays.values.map { CGWindowID($0.windowNumber) })) }.map(\.id)
+            movingWindows = MainActor.assumeIsolated {
+                motion.sync(candidates: watch)
+                return Set(watch.filter { motion.isMoving($0) })
+            }
+        } else {
+            movingWindows = []
+        }
         for w in wins where lastFocus[w.id] == nil || isExempt(w) { lastFocus[w.id] = now }
         // 不在屏幕上的窗口（切到别的桌面空间、最小化）保留计时，回来时接着褪；每 10 秒清一次已经关掉的
         pollCount += 1
@@ -353,7 +403,9 @@ final class Fader {
         let screenH = NSScreen.screens.first?.frame.height ?? 0
         // 各屏幕在 CG 坐标（左上角原点）里的范围，透视时只处理窗口在屏幕内的部分
         let screensCG = NSScreen.screens.map { CGRect(x: $0.frame.minX, y: screenH - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height) }
-        var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges)] = [:]
+        var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool, edges: Edges, covered: Bool)] = [:]
+        let mine = Set(overlays.values.map { CGWindowID($0.windowNumber) })
+        var coveredWindows = Set<CGWindowID>()
 
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
@@ -405,6 +457,8 @@ final class Fader {
                 let oi = order.firstIndex(of: CGWindowID(win.windowNumber)), wi = order.firstIndex(of: w.id)
                 if oi == nil || wi == nil || oi! + 1 != wi! { win.order(.above, relativeTo: Int(w.id)) }
             }
+            let hidden = Self.isFullyCovered(b, by: frames, before: w.id, ignoring: mine)
+            if hidden { coveredWindows.insert(w.id) }
             if current == .seeThrough, let v = win.contentView as? SeeView {
                 // 被屏幕边缘截掉的边不是真边：那里不画圆角也不画玻璃边框（CG 坐标里 minY 是上边）
                 var edges: Edges = []
@@ -414,22 +468,70 @@ final class Fader {
                 if b.maxY >= w.bounds.maxY - 0.5 { edges.insert(.bottom) }
                 v.edges = edges
                 let clipped = WinInfo(id: w.id, pid: w.pid, owner: w.owner, title: w.title, bounds: b, layer: w.layer)
-                seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving, edges)
+                seeTargets[w.id] = (clipped, v, CGWindowID(win.windowNumber), target <= 0.002 || moving, edges, hidden)
             }
         }
 
         if current == .seeThrough {
             MainActor.assumeIsolated { seeThrough.sync(targets: seeTargets, order: order) }
         }
+
+        // 动画暂停时只有这里能把它叫醒：有窗口还没褪到位/没恢复完、透视画面就绪了、外观设置变了
+        let live = current == .seeThrough ? MainActor.assumeIsolated { Set(overlays.keys.filter { seeThrough.isLive($0) }) } : []
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let pending = overlays.keys.contains { abs((targets[$0] ?? 0) - (shown[$0] ?? 0)) > 0.001 || (vis[$0] ?? 1) < 1 }
+        if pending || live != lastLive || dark != lastDark || privacyFrost != lastPrivacy {
+            setAnimationPaused(false)
+        }
+        lastLive = live
+        lastDark = dark
+        lastPrivacy = privacyFrost
+    }
+
+    /// 窗口是不是被它前面的窗口完全挡住了（在窗口上撒一张 8×6 的点阵，每个点都被挡住才算）。
+    /// 完全看不见的窗口不必抓画面、也不必看它在不在动
+    static func isFullyCovered(_ b: CGRect, by frames: [(id: CGWindowID, bounds: CGRect, opaque: Bool)], before id: CGWindowID, ignoring mine: Set<CGWindowID>) -> Bool {
+        guard let idx = frames.firstIndex(where: { $0.id == id }), idx > 0 else { return false }
+        let front = frames[..<idx].filter { $0.opaque && !mine.contains($0.id) }.map(\.bounds)
+        guard !front.isEmpty else { return false }
+        let r = b.insetBy(dx: 4, dy: 4)
+        for i in 0..<8 {
+            for j in 0..<6 {
+                let pt = CGPoint(x: r.minX + r.width * CGFloat(i) / 7, y: r.minY + r.height * CGFloat(j) / 5)
+                if !front.contains(where: { $0.contains(pt) }) { return false }
+            }
+        }
+        return true
     }
 
     // MARK: - 每帧：平滑过渡
+
+    /// 连续多少帧什么都没变；够多了就暂停屏幕刷新回调，省掉每秒上百次的唤醒
+    private var quietFrames = 0
+    private var lastLive = Set<CGWindowID>()
+    private var lastDark = false
+    private var lastPrivacy = true
+
+    private func setAnimationPaused(_ paused: Bool) {
+        if #available(macOS 14, *), let link = displayLink as? CADisplayLink, link.isPaused != paused {
+            link.isPaused = paused
+            if !paused { lastAnim = Date() }
+        }
+    }
 
     private func animate() {
         let now = Date()
         let dt = min(now.timeIntervalSince(lastAnim), 0.1)
         lastAnim = now
-        guard !overlays.isEmpty else { return }
+        guard !overlays.isEmpty else {
+            setAnimationPaused(true)
+            return
+        }
+        var changed = false
+        defer {
+            quietFrames = changed ? 0 : quietFrames + 1
+            if quietFrames > 30 { setAnimationPaused(true) }
+        }
 
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let veil = dark ? NSColor(white: 0.08, alpha: 1) : NSColor(white: 0.94, alpha: 1)
@@ -464,8 +566,9 @@ final class Fader {
             } else {
                 v = 0
             }
+            if s != target || v < 1 { changed = true }
             vis[id] = v
-            apply(amount: s * v, id: id, style: current, veil: veil, to: win)
+            if apply(amount: s * v, id: id, style: current, veil: veil, to: win) { changed = true }
         }
     }
 
@@ -473,11 +576,12 @@ final class Fader {
     private struct Applied: Equatable { var amount: CGFloat; var live: Bool; var dark: Bool; var frost: Bool }
     private var applied: [CGWindowID: Applied] = [:]
 
-    /// amount: 0...1，0 是没褪，1 是褪到最浅
-    private func apply(amount: CGFloat, id: CGWindowID, style: FadeStyle, veil: NSColor, to win: NSWindow) {
+    /// amount: 0...1，0 是没褪，1 是褪到最浅。返回这次有没有真的改动
+    @discardableResult
+    private func apply(amount: CGFloat, id: CGWindowID, style: FadeStyle, veil: NSColor, to win: NSWindow) -> Bool {
         let live = style == .seeThrough && MainActor.assumeIsolated({ seeThrough.isLive(id) })
         let state = Applied(amount: (amount * 1000).rounded() / 1000, live: live, dark: veil.whiteComponent < 0.5, frost: privacyFrost)
-        if applied[id] == state { return }
+        if applied[id] == state { return false }
         applied[id] = state
 
         if style == .seeThrough, let v = win.contentView as? SeeView {
@@ -500,7 +604,7 @@ final class Fader {
                 v.rim.opacity = 0
             }
             CATransaction.commit()
-            return
+            return true
         }
         win.alphaValue = 1
         if #available(macOS 26, *), let glass = win.contentView as? NSGlassEffectView {
@@ -510,6 +614,7 @@ final class Fader {
         } else {
             win.contentView?.layer?.backgroundColor = veil.withAlphaComponent(Self.maxAlpha * amount).cgColor
         }
+        return true
     }
 
     private func makeOverlay() -> NSWindow {
