@@ -130,8 +130,8 @@ final class Fader {
     static let maxSeeThrough: CGFloat = 0.72
 
     func start() {
-        // 窗口列表 30 次/秒，好尽早发现窗口在动；动画 60 帧/秒，只改透明度，开销很小
-        let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.poll() }
+        // 窗口列表 20 次/秒，好尽早发现窗口在动（没有雾层时 poll 里再降到 4 次/秒）
+        let t = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         // 动画跟着屏幕刷新走（120 Hz 屏上就是 120 帧）；macOS 13 没有这个接口，退回 60 Hz 计时器
@@ -282,8 +282,14 @@ final class Fader {
 
     // MARK: - 每 0.1 秒：算目标、跟随窗口位置
 
+    private var lastPoll = Date.distantPast
+
     private func poll() {
         guard !paused else { return }
+        // 有雾层在屏幕上时每秒 20 次（要及时发现窗口在动）；没有时每秒 4 次就够算闲置了
+        let started = Date()
+        if overlays.isEmpty, started.timeIntervalSince(lastPoll) < 0.25 { return }
+        lastPoll = started
         let (wins, order, frames, missionControl) = Self.onScreenWindows()
         let now = Date()
 
@@ -292,7 +298,7 @@ final class Fader {
         if missionControl {
             if !inMissionControl {
                 inMissionControl = true
-                for (id, win) in overlays { vis[id] = 0; win.alphaValue = 0 }
+                for (id, win) in overlays { vis[id] = 0; win.alphaValue = 0; applied[id] = nil }
             }
             return
         }
@@ -330,6 +336,7 @@ final class Fader {
         for (id, win) in overlays where !alive.contains(id) {
             win.orderOut(nil)
             overlays[id] = nil
+            applied[id] = nil
         }
         targets = targets.filter { alive.contains($0.key) }
         shown = shown.filter { alive.contains($0.key) }
@@ -374,6 +381,7 @@ final class Fader {
                 shown[w.id] = 0
                 vis[w.id] = 1
                 win.alphaValue = 0
+                applied[w.id] = nil
             }
             if win.frame != frame {
                 if win.frame.width > 0 {
@@ -381,6 +389,7 @@ final class Fader {
                     lastMoved[w.id] = now
                     vis[w.id] = 0
                     win.alphaValue = 0
+                    applied[w.id] = nil
                 }
                 win.setFrame(frame, display: false)
             }
@@ -438,6 +447,7 @@ final class Fader {
             if s <= 0.002, target <= 0.002 {
                 win.orderOut(nil)
                 overlays[id] = nil
+            applied[id] = nil
                 shown[id] = 0
                 continue
             }
@@ -459,12 +469,21 @@ final class Fader {
         }
     }
 
+    /// 上一次画到每个雾层上的状态；没变就不再设，每次设置都要和窗口服务器通信，每秒上百次很费电
+    private struct Applied: Equatable { var amount: CGFloat; var live: Bool; var dark: Bool; var frost: Bool }
+    private var applied: [CGWindowID: Applied] = [:]
+
     /// amount: 0...1，0 是没褪，1 是褪到最浅
     private func apply(amount: CGFloat, id: CGWindowID, style: FadeStyle, veil: NSColor, to win: NSWindow) {
+        let live = style == .seeThrough && MainActor.assumeIsolated({ seeThrough.isLive(id) })
+        let state = Applied(amount: (amount * 1000).rounded() / 1000, live: live, dark: veil.whiteComponent < 0.5, frost: privacyFrost)
+        if applied[id] == state { return }
+        applied[id] = state
+
         if style == .seeThrough, let v = win.contentView as? SeeView {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            if MainActor.assumeIsolated({ seeThrough.isLive(id) }) {
+            if live {
                 // 中间：盖上“窗口后面”的实时画面，按比例变淡，看起来就是窗口本身变透明了
                 // 边缘：玻璃边框比中间更早、更实地出现，褪尽之后窗口轮廓依然清楚
                 win.alphaValue = 1
@@ -524,6 +543,7 @@ final class Fader {
         MainActor.assumeIsolated { seeThrough.stopAll() }
         overlays.values.forEach { $0.orderOut(nil) }
         overlays.removeAll()
+        applied.removeAll()
         shown.removeAll()
     }
 }

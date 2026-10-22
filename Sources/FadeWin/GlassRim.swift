@@ -65,8 +65,20 @@ enum GlassRim {
         guard let out = kernel.apply(extent: e, roiCallback: { _, r in r.insetBy(dx: -pad, dy: -pad) },
                                      arguments: [src.clampedToExtent(), rect,
                                                  cornerRadius * scale, band * scale, strength * scale, spread]) else { return false }
-        context.render(out, to: dest, bounds: e, colorSpace: nil)
+
+        // 一帧只提交一次渲染：开销主要在每次提交，而不在像素多少
+        let dst = CIRenderDestination(ioSurface: dest)
+        dst.colorSpace = nil
+        _ = try? context.startTask(toRender: out, from: e, to: dst, at: e.origin)
         return true
+    }
+
+    /// 新建一块全透明的画布
+    static func makeClearSurface(width: Int, height: Int) -> IOSurface? {
+        guard let s = makeSurface(width: width, height: height) else { return nil }
+        let dst = CIRenderDestination(ioSurface: s)
+        _ = try? context.startTask(toClear: dst).waitUntilCompleted()
+        return s
     }
 
     static func makeSurface(width: Int, height: Int) -> IOSurface? {

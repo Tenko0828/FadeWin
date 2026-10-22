@@ -13,6 +13,11 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 边框画在这三块轮流用的画布上，避免正在显示的那块被下一帧改写
     private var rimPool: [IOSurface] = []
     private var rimIndex = 0
+    /// 画布上画的是哪几条边；变了就得换新画布，不然被截掉那一侧会留下旧边框
+    private var poolEdges: Edges = .all
+    /// 边框每秒最多重画 10 次：边框里只是被折射的背景，晚一点看不出来，但每次重画都很费 CPU
+    private var lastRim: CFTimeInterval = 0
+    private static let rimInterval: CFTimeInterval = 0.1
     private(set) var live = false
     // 抓取线程只需要这两个值；一起取快照，避免画边框时和主线程争读写
     private struct CaptureGeometry {
@@ -56,11 +61,15 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         // 在抓取线程上把边框画好，主线程只负责换图
         let geometry = geometry.withLock { $0 }
         let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-        if rimPool.first.map({ $0.width != w || $0.height != h }) ?? true {
-            rimPool = (0..<3).compactMap { _ in GlassRim.makeSurface(width: w, height: h) }
+        let now = CACurrentMediaTime()
+        let edgesChanged = poolEdges != geometry.edges
+        if rimPool.first.map({ $0.width != w || $0.height != h }) ?? true || edgesChanged {
+            rimPool = (0..<3).compactMap { _ in GlassRim.makeClearSurface(width: w, height: h) }
+            poolEdges = geometry.edges
         }
         var rimSurface: IOSurface?
-        if rimPool.count == 3 {
+        if rimPool.count == 3, now - lastRim >= Self.rimInterval || edgesChanged {
+            lastRim = now
             let dest = rimPool[rimIndex]
             rimIndex = (rimIndex + 1) % 3
             let scale = CGFloat(w) / max(geometry.width, 1)
@@ -186,7 +195,8 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         cfg.showsCursor = false
         cfg.scalesToFit = true
         cfg.queueDepth = 3
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: replicas.count >= 3 ? 15 : 30)
+        // 透出来的是半透明的背景，20 帧足够顺；同时透视的窗口多了再减半，省电
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: replicas.count >= 3 ? 10 : 20)
         return cfg
     }
 
