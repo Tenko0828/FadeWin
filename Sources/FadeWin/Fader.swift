@@ -103,6 +103,29 @@ final class Fader {
         let a = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.animate() }
         RunLoop.main.add(a, forMode: .common)
         animTimer = a
+
+        // 点下去的那一刻就把雾层提到最上面，赶在窗口被系统提到前台之前；
+        // 否则窗口会先盖住雾层（一下变清晰），下一次轮询雾层又盖回来（一下变模糊），就是闪
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.mouseDown() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in self?.poll() }
+    }
+
+    private func mouseDown() {
+        let p = NSEvent.mouseLocation
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        let pt = CGPoint(x: p.x, y: h - p.y)
+        guard let w = snapshot.first(where: { $0.bounds.contains(pt) }), let win = overlays[w.id], (shown[w.id] ?? 0) > 0.002 else { return }
+        lastFocus[w.id] = Date()
+        targets[w.id] = 0
+        raise(win)
+    }
+
+    /// 正在恢复的雾层放到普通窗口之上：它盖着的窗口这时本来就在最前面，所以看起来没区别，但不会被窗口抢到上面
+    private func raise(_ win: NSWindow) {
+        guard win.level != .floating else { return }
+        win.level = .floating
+        win.orderFront(nil)
     }
 
     func idleSeconds(of id: CGWindowID) -> Double {
@@ -162,7 +185,8 @@ final class Fader {
 
         let (grace, full) = speed.span
         let screenH = NSScreen.screens.first?.frame.height ?? 0
-        var seeTargets: [CGWindowID: (win: WinInfo, view: NSView, overlay: CGWindowID)] = [:]
+        var seeTargets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool)] = [:]
+        let focusedID = wins.first(where: { $0.pid == frontPid })?.id
 
         for w in wins {
             let idle = now.timeIntervalSince(lastFocus[w.id] ?? now)
@@ -183,8 +207,17 @@ final class Fader {
                 win.alphaValue = 0
             }
             if win.frame != frame { win.setFrame(frame, display: false) }
-            win.order(.above, relativeTo: Int(w.id))
-            if current == .seeThrough, let v = win.contentView { seeTargets[w.id] = (w, v, CGWindowID(win.windowNumber)) }
+            if w.id == focusedID, target <= 0.002 {
+                raise(win)
+            } else {
+                if win.level != .normal { win.level = .normal }
+                // 只在雾层不在窗口正上方时才调整层级，少折腾窗口服务器
+                let oi = order.firstIndex(of: CGWindowID(win.windowNumber)), wi = order.firstIndex(of: w.id)
+                if oi == nil || wi == nil || oi! + 1 != wi! { win.order(.above, relativeTo: Int(w.id)) }
+            }
+            if current == .seeThrough, let v = win.contentView as? SeeView {
+                seeTargets[w.id] = (w, v, CGWindowID(win.windowNumber), target <= 0.002)
+            }
         }
 
         if current == .seeThrough {
@@ -207,8 +240,8 @@ final class Fader {
         for (id, win) in overlays {
             let target = targets[id] ?? 0
             var s = shown[id] ?? 0
-            // 褪色慢慢跟上；回到前台时 0.2 秒左右快速恢复
-            let rate = target > s ? 2.5 : 14.0
+            // 褪色慢慢跟上；回到前台时约 0.3 秒快速恢复
+            let rate = target > s ? 2.5 : 10.0
             s += (target - s) * CGFloat(1 - exp(-rate * dt))
             if abs(target - s) < 0.002 { s = target }
             shown[id] = s
@@ -225,16 +258,24 @@ final class Fader {
 
     /// amount: 0...1，0 是没褪，1 是褪到最浅
     private func apply(amount: CGFloat, id: CGWindowID, style: FadeStyle, veil: NSColor, to win: NSWindow) {
-        if style == .seeThrough, let v = win.contentView {
+        if style == .seeThrough, let v = win.contentView as? SeeView {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             if MainActor.assumeIsolated({ seeThrough.isLive(id) }) {
-                // 盖上“窗口后面”的实时画面，再按比例变淡：看起来就是窗口本身变透明了
+                // 中间：盖上“窗口后面”的实时画面，按比例变淡，看起来就是窗口本身变透明了
+                // 边缘：玻璃边框比中间更早、更实地出现，褪尽之后窗口轮廓依然清楚
+                win.alphaValue = 1
                 v.layer?.backgroundColor = nil
-                win.alphaValue = Self.maxSeeThrough * amount
+                v.base.opacity = Float(Self.maxSeeThrough * amount)
+                v.rim.opacity = Float(min(1, amount * 1.6))
             } else {
                 // 还没抓到画面（刚开始，或超过同时抓取上限）：先用薄雾顶着
-                v.layer?.backgroundColor = veil.cgColor
                 win.alphaValue = Self.maxAlpha * amount
+                v.layer?.backgroundColor = veil.cgColor
+                v.base.opacity = 0
+                v.rim.opacity = 0
             }
+            CATransaction.commit()
             return
         }
         win.alphaValue = 1
@@ -256,7 +297,9 @@ final class Fader {
         win.isReleasedWhenClosed = false
         win.animationBehavior = .none
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
-        if #available(macOS 26, *), effectiveStyle == .glass {
+        if effectiveStyle == .seeThrough {
+            win.contentView = SeeView(frame: .zero)
+        } else if #available(macOS 26, *), effectiveStyle == .glass {
             let glass = NSGlassEffectView()
             glass.style = .regular
             glass.cornerRadius = 20

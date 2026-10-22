@@ -6,14 +6,17 @@ import ScreenCaptureKit
 /// 雾层再按比例变透明，叠起来的效果就是这个窗口本身变透明了
 final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     let stream: SCStream
-    weak var view: NSView?
+    weak var view: SeeView?
+    /// 边框画在这三块轮流用的画布上，避免正在显示的那块被下一帧改写
+    private var rimPool: [IOSurface] = []
+    private var rimIndex = 0
     private(set) var live = false
     var bounds: CGRect
     var excluded: Set<CGWindowID>
     var updating = false
     var onStop: (() -> Void)?
 
-    init(stream: SCStream, view: NSView, bounds: CGRect, excluded: Set<CGWindowID>) {
+    init(stream: SCStream, view: SeeView, bounds: CGRect, excluded: Set<CGWindowID>) {
         self.stream = stream
         self.view = view
         self.bounds = bounds
@@ -25,10 +28,29 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
               let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = arr.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pb = CMSampleBufferGetImageBuffer(sb),
-              let surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue() else { return }
+              let surfaceRef = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue() else { return }
+        let surface = unsafeBitCast(surfaceRef, to: IOSurface.self)
+
+        // 在抓取线程上把边框画好，主线程只负责换图
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        if rimPool.first.map({ $0.width != w || $0.height != h }) ?? true {
+            rimPool = (0..<3).compactMap { _ in GlassRim.makeSurface(width: w, height: h) }
+        }
+        var rimSurface: IOSurface?
+        if rimPool.count == 3 {
+            let dest = rimPool[rimIndex]
+            rimIndex = (rimIndex + 1) % 3
+            let scale = CGFloat(w) / max(bounds.width, 1)
+            if GlassRim.render(surface, scale: scale, into: dest) { rimSurface = dest }
+        }
+
         DispatchQueue.main.async { [weak self] in
-            guard let self, let layer = self.view?.layer else { return }
-            layer.contents = surface
+            guard let self, let view = self.view else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            view.base.contents = surface
+            if let rimSurface { view.rim.contents = rimSurface }
+            CATransaction.commit()
             self.live = true
         }
     }
@@ -63,7 +85,7 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 每次轮询调一次：targets 是正在褪色的窗口和它们的雾层视图，order 是屏幕上所有窗口从前到后的顺序。
     /// 一个窗口的“后面”= 屏幕去掉它自己以及所有在它前面的窗口（含 Dock、菜单栏、前面窗口的雾层）。
     /// 这样后面窗口的雾层里不会混进前面窗口的旧画面，叠在一起的窗口各褪各的
-    func sync(targets: [CGWindowID: (win: WinInfo, view: NSView, overlay: CGWindowID)], order: [CGWindowID]) {
+    func sync(targets: [CGWindowID: (win: WinInfo, view: SeeView, overlay: CGWindowID, frozen: Bool)], order: [CGWindowID]) {
         for id in replicas.keys where targets[id] == nil {
             if let r = replicas.removeValue(forKey: id) { Task { try? await r.stream.stopCapture() } }
         }
@@ -83,11 +105,12 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         for (id, t) in targets {
             guard let wanted = front[id]?.intersection(known) else { continue }
             if let r = replicas[id] {
-                guard !r.updating else { continue }
+                // 正在恢复（窗口刚被点回前台）时不换抓取范围：换的那一下画面会跳，看起来就是闪
+                guard !r.updating, !t.frozen else { continue }
                 if r.bounds != t.win.bounds || r.excluded != wanted {
                     update(r, bounds: t.win.bounds, excluding: wanted, content: content)
                 }
-            } else if !starting.contains(id), replicas.count + starting.count < Self.maxReplicas {
+            } else if !t.frozen, !starting.contains(id), replicas.count + starting.count < Self.maxReplicas {
                 start(id: id, win: t.win, view: t.view, excluding: wanted, content: content)
             }
         }
@@ -134,7 +157,7 @@ final class Replica: NSObject, SCStreamOutput, SCStreamDelegate {
         SCContentFilter(display: display, excludingWindows: content.windows.filter { ids.contains($0.windowID) })
     }
 
-    private func start(id: CGWindowID, win: WinInfo, view: NSView, excluding excluded: Set<CGWindowID>, content: SCShareableContent) {
+    private func start(id: CGWindowID, win: WinInfo, view: SeeView, excluding excluded: Set<CGWindowID>, content: SCShareableContent) {
         guard let disp = display(for: win.bounds, in: content) else { return }
         let stream = SCStream(filter: filter(display: disp, excluding: excluded, content: content),
                               configuration: config(bounds: win.bounds, display: disp), delegate: nil)
